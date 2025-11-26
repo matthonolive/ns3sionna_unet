@@ -115,6 +115,9 @@ public:
     const static int MODE_P2MP = 2; // a full CSI P2MP (TX to all other RX nodes) is computed within a single Sionna call
     const static int MODE_P2MP_LAH = 3; // same as mode 2 but in addition also future not yet needed channels are computed
 
+    // submode operations
+    const static int SUB_MODE_IGNORED = -1;
+
     // default value used by ns spectrummodel
     const static int GUARD_MULTIPLIER = 3;
 };

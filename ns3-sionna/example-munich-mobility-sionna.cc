@@ -245,6 +245,8 @@ RunSimulation(SionnaHelper &sionnaHelper,
     double channelWidth = get_channel_width(apDevices.Get(0));
     sionnaHelper.Configure(get_center_freq(apDevices.Get(0)),
         channelWidth, getFFTSize(wifi_standard, channelWidth), getSubcarrierSpacing(wifi_standard));
+    sionnaHelper.SetMode(SionnaHelper::MODE_P2MP_LAH);
+    sionnaHelper.SetSubMode(SionnaHelper::SUB_MODE_IGNORED);
 
     Simulator::Stop(Seconds(sim_duration_sec));
 

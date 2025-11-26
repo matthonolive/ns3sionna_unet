@@ -13,7 +13,7 @@ message SimInitMessage {
     uint32 fft_size = 5; // size of FFT
     uint32 subcarrier_spacing = 6; // OFDM subcarrier spacing in Hz
     uint32 mode = 7; // mode of operation: 1=P2P, 2=P2MP, 3=P2MP+lookahead
-    uint32 sub_mode = 8; // used in mode=3: max. no of parallel links to be computed in single call to Sionna
+    int32 sub_mode = 8; // used in mode=3: max. no of parallel links to be computed in single call to Sionna, -1 if ignored
     uint32 min_coherence_time_ms = 9; // minimal coherence time in milliseconds
 
     // each node is defined by ID, location and mobility model
