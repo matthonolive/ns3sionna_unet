@@ -31,9 +31,8 @@ if gpus:
         print(e)
 tf.get_logger().setLevel('ERROR')
 
-from sionna.rt import load_scene, Transmitter, Receiver, PlanarArray, Camera
-from sionna.channel import cir_to_ofdm_channel, subcarrier_frequencies
-from sionna.rt.antenna import iso_pattern
+import sionna.rt
+from sionna.rt import load_scene, Transmitter, Receiver, PlanarArray, Camera, PathSolver, subcarrier_frequencies
 
 class CacheEntry:
     def __init__(self, sim_time, ttl, value):
@@ -85,14 +84,16 @@ class SionnaEnv:
 
         # Load the mitsuba scene used by the mobility model
         # Mobility model uses mitsuba SCALAR variant
-        mi.set_variant('scalar_rgb')
-        self.mi_scene = mi.load_file(filepath, parallel=False)
+        # mi.set_variant('scalar_rgb')
+        # self.mi_scene = mi.load_file(filepath, parallel=False)
 
-        # Set the mitsuba variant back to how Sionna configures it
-        if len(gpus) > 0:
-            mi.set_variant('cuda_ad_rgb')
-        else:
-            mi.set_variant('llvm_ad_rgb')
+        # # Set the mitsuba variant back to how Sionna configures it
+        # if len(gpus) > 0:
+        #     mi.set_variant('cuda_ad_rgb')
+        # else:
+        #     mi.set_variant('llvm_ad_rgb')
+
+        self.mi_scene = self.scene.mi_scene
 
         # SISO mode only
         # Configure antenna array for all transmitters
@@ -100,28 +101,25 @@ class SionnaEnv:
                                      num_cols=1,
                                      vertical_spacing=0.5,
                                      horizontal_spacing=0.5,
-                                     pattern=iso_pattern)
+                                     pattern="iso", polarization = "V")
 
         # Configure antenna array for all receivers
         self.scene.rx_array = PlanarArray(num_rows=1,
                                      num_cols=1,
                                      vertical_spacing=0.5,
                                      horizontal_spacing=0.5,
-                                     pattern=iso_pattern)
+                                     pattern="iso", polarization="V")
         print(f'Scenario: {simulation_info.scene_fname}')
         print(f'Params: F0={simulation_info.frequency}MHz, BW={simulation_info.channel_bw}MHz, '
               f'FFT={simulation_info.fft_size}, df={simulation_info.subcarrier_spacing}Hz, '
               f'minTc={simulation_info.min_coherence_time_ms}ms')
 
-        # Set scene parameters
         self.scene.frequency = simulation_info.frequency * 1e6
-        self.scene.channel_bw = simulation_info.channel_bw * 1e6 # max channel bandwidth
-        self.scene.fft_size = simulation_info.fft_size  # max FFT size
-        self.scene.min_coherence_time_ms = simulation_info.min_coherence_time_ms # min Tc
-        self.scene.subcarrier_spacing = simulation_info.subcarrier_spacing # in Hz
-
-        # If set to False, ray tracing will be done per antenna element (slower for large arrays)
-        self.scene.synthetic_array = True
+        self.scene.bandwidth = simulation_info.channel_bw * 1e6 
+        self.fft_size = int(simulation_info.fft_size)
+        self.subcarrier_spacing = float(simulation_info.subcarrier_spacing)
+        self.min_coherence_time_ms = float(simulation_info.min_coherence_time_ms)
+        self.synthetic_array = True
 
         # Set the random seed for reproducibility
         np.random.seed(simulation_info.seed)
@@ -201,7 +199,7 @@ class SionnaEnv:
         #self.chan_coh_time_mode23 = int(9 * 299792458 * 1e9 / (16 * np.pi * 2 * max_v * self.scene.frequency.numpy()))
         self.chan_coh_time_mode23 = compute_coherence_time(max_v, self.scene.frequency.numpy(), model='rappaport2')
         # consider minimum coherence time which is given in ms
-        self.chan_coh_time_mode23 = min(self.chan_coh_time_mode23, self.scene.min_coherence_time_ms * 1e6)
+        self.chan_coh_time_mode23 = min(self.chan_coh_time_mode23, self.min_coherence_time_ms * 1e6)
 
         if self.mode == 3 or self.mode == 2:
             # worst case coherence time
@@ -311,70 +309,57 @@ class SionnaEnv:
                 self.pos_velo_cache[node_id].append(tmp)
 
         # WiFi parameters
-        subcarrier_spacing = self.scene.subcarrier_spacing #(self.scene.channel_bw / self.scene.fft_size)
-        fft_size = self.scene.fft_size
+        subcarrier_spacing = self.subcarrier_spacing #(self.scene.channel_bw / self.scene.fft_size)
+        fft_size = self.fft_size
 
         a, tau = 0, 0
         a_tau_set = False
 
-        # Compute propagation paths
-        paths = self.scene.compute_paths(max_depth=self.rt_max_depth,
-                                    method="fibonacci",
-                                    num_samples=1e6,
-                                    los=True,
-                                    reflection=True,
-                                    diffraction=self.rt_calc_diffraction,
-                                    scattering=False)
+        
+        #GROUND CONTROL TO MAJOR TOM
+        if not hasattr(self, "_path_solver"):
+            self._path_solver = PathSolver()
+        solver = self._path_solver
 
-        has_paths = bool(paths.types.numpy().size)
-        has_los_path = np.any(paths.types.numpy()[0] == 0)
+        paths = solver(
+            scene=self.scene,
+            max_depth=self.rt_max_depth,
+            max_num_paths_per_src=int(1e6),
+            samples_per_src=int(1e6),
+            synthetic_array=self.synthetic_array,   
+            los=True,
+            specular_reflection=True,
+            diffuse_reflection=False,
+            refraction=True,                       
+            diffraction=self.rt_calc_diffraction,
+            edge_diffraction=False,
+        )
 
-        # If no LOS path was found, check again with different compute_paths parameters
-        if not has_los_path:
-            los_path = self.scene.compute_paths(max_depth=0,
-                                           method="fibonacci",
-                                           num_samples=1e6,
-                                           los=True,
-                                           reflection=False,
-                                           diffraction=False,
-                                           scattering=False)
+        # CIR (for delays)
+        a, tau = paths.cir(normalize_delays=False, out_type="tf")  # tau shape per docs :contentReference[oaicite:4]{index=4}
+        if not bool(tf.reduce_any(tau >= 0).numpy()):
+            raise SystemExit(
+                "Error: Propagation loss and propagation delay cannot be calculated because no propagation paths were found."
+            )
 
-            has_los_path = bool(los_path.types.numpy().size)
+        # CFR
+        frequencies = subcarrier_frequencies(
+            num_subcarriers=fft_size,
+            subcarrier_spacing=subcarrier_spacing
+        )
 
-            if not has_paths and not has_los_path:
-                raise SystemExit(
-                    "Error: Propagation loss and propagation delay cannot be calculated because no propagation paths were found. "
-                    "Make sure that the nodes are not spatially separated in the 3D model and check the parameters of the compute_path() function.")
-            if has_los_path:
-                # Disable normalization of delays for LOS path
-                los_path.normalize_delays = False
-                # Compute the channel impulse response for LOS path
-                a, tau = los_path.cir()
-                a_tau_set = True
+        h_freq_raw = paths.cfr(frequencies, normalize_delays=False, normalize=False, out_type="tf")
+        h_freq     = paths.cfr(frequencies, normalize_delays=False, normalize=True,  out_type="tf")
 
-        if has_paths:
-            # Disable normalization of delays for paths
-            paths.normalize_delays = False
-            # Compute the channel impulse response for path
-            a_paths, tau_paths = paths.cir()
+        # If cfr() ever returns (re, im) tuples in your setup, convert:
+        if isinstance(h_freq_raw, (tuple, list)):
+            h_freq_raw = tf.complex(h_freq_raw[0], h_freq_raw[1])
+        if isinstance(h_freq, (tuple, list)):
+            h_freq = tf.complex(h_freq[0], h_freq[1])
 
-            # Set a and tau
-            if a_tau_set:
-                a = tf.concat([a, a_paths], axis=5)
-                tau = tf.concat([tau, tau_paths], axis=3)
-            else:
-                a, tau = a_paths, tau_paths
-
-        # Compute the frequencies of subcarriers and center around carrier frequency
-        frequencies = subcarrier_frequencies(num_subcarriers=fft_size,
-                                             subcarrier_spacing=subcarrier_spacing)
-
-        # Compute the frequency response of the channel at frequencies
-        # tensor: [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_time_steps, fft_size]
-        # absolute
-        h_freq_raw = cir_to_ofdm_channel(frequencies=frequencies, a=a, tau=tau, normalize=False)
-        # norm
-        h_freq = cir_to_ofdm_channel(frequencies=frequencies, a=a, tau=tau, normalize=True)
+        # Build robust name->index maps (Scene.receivers/transmitters are dicts) :contentReference[oaicite:5]{index=5}
+        rx_index_of = {name:i for i, name in enumerate(self.scene.receivers.keys())}
+        tx_index_of = {name:i for i, name in enumerate(self.scene.transmitters.keys())}
 
         # ZMQ response
         chan_response = reply_wrapper.channel_state_response
@@ -393,21 +378,28 @@ class SionnaEnv:
             csi.tx_node.position.z = tx_pos[future_id][2]
 
             for lnk_id, rx_node in enumerate(all_rx_nodes):
+
                 # compute the index for the rx nodes into tensor
-                tf_index = future_id * len(all_rx_nodes) + lnk_id
+                rx_name = f"rx{rx_node}.{future_id}"
+                tx_name = f"tx{future_id}"
 
-                lnk_h_freq_raw = h_freq_raw.numpy()[:, tf_index, :, future_id, :, :, :]
-                lnk_h_freq = h_freq.numpy()[:, tf_index, :, future_id, :, :, :]
-                lnk_tau = tau.numpy()[:, tf_index, future_id, :]
+                rx_i = rx_index_of[rx_name]
+                tx_i = tx_index_of[tx_name]
 
-                # Calculate propagation delay and propagation loss
+                # Handle tau possibly being reduced-rank ([num_rx,num_tx,num_paths]) :contentReference[oaicite:6]{index=6}
+                tau_np = tau.numpy()
+                if tau_np.ndim == 5:
+                    lnk_tau = tau_np[rx_i, 0, tx_i, 0, :]
+                else:  # ndim == 3
+                    lnk_tau = tau_np[rx_i, tx_i, :]
+
+                # CFR is [num_rx, num_rx_ant, num_tx, num_tx_ant, num_time_steps, num_freqs]
+                lnk_h_freq_raw = h_freq_raw[rx_i, 0, tx_i, 0, 0, :].numpy()
+                lnk_h_freq     = h_freq[rx_i, 0, tx_i, 0, 0, :].numpy()
+
                 lnk_delay = int(round(np.min(lnk_tau[lnk_tau >= 0] * 1e9), 0))
-
-                # see Parseval's theorem
-                lnk_loss = float(-10 * np.log10(tf.reduce_mean(tf.abs(lnk_h_freq_raw) ** 2).numpy()))
-
-                # the channel frequency response (CFR)
-                lnk_csi = lnk_h_freq.flatten()
+                lnk_loss  = float(-10*np.log10(np.mean(np.abs(lnk_h_freq_raw)**2)))
+                lnk_csi   = lnk_h_freq  # already length fft_size
 
                 if self.mode == 1 and self.sub_mode > 0:
                     # Calculate the time to live for the cache entry with the coherence time and the remaining times
@@ -471,66 +463,55 @@ class SionnaEnv:
 
         self.node_info_dict[node_id]["last update"] += delay_left
 
-        position = np.array(self.node_info_dict[node_id]["position"])
-        velocity = np.array(self.node_info_dict[node_id]["velocity"])
+        position = np.array(self.node_info_dict[node_id]["position"], dtype=float)
+        velocity = np.array(self.node_info_dict[node_id]["velocity"], dtype=float)
 
         speed = np.linalg.norm(velocity)
         if speed == 0:
             return
 
-        # Check if the next position is inside the borders
-        # Calculate direction vector and travel distance
         direction = velocity / speed
         distance = np.linalg.norm(velocity * delay_left / 1e9)
 
-        # Set mitsuba variant to SCALAR for mobility model
-        mi.set_variant('scalar_rgb')
+        # IMPORTANT: do NOT change Mitsuba variants here in Sionna 1.2.1
 
         while True:
-            # Create a ray
-            ray = mi.Ray3f(mi.Point3f(position), mi.Vector3f(direction), distance, 0.0, [])
+            # Create a ray (variant-safe constructor)
+            o = mi.Point3f(position)
+            d = mi.Vector3f(direction)
 
-            # Calculate the intersection of the ray with the scene
+            ray0 = mi.Ray3f(o, d, mi.Float(0.0))
+            ray  = mi.Ray3f(ray0, mi.Float(distance))
+
             ray_flags = mi.RayFlags.Minimal
-            coherent = False
-            active = True
-            si = self.mi_scene.ray_intersect(ray, ray_flags, coherent, active)
+
+            # Intersection (be tolerant to different Mitsuba signatures)
+            try:
+                si = self.mi_scene.ray_intersect(ray, ray_flags, coherent=False, active=True)
+            except TypeError:
+                si = self.mi_scene.ray_intersect(ray, ray_flags)
 
             if si.is_valid():
-                # If the ray hits an object, calculate the reflection
-
-                # The intersection point (position) is set back by one centimeter to prevent cases
-                # where the intersection point is found behind a wall
-                t = si.t - 0.01
+                # Move to hit point (back off slightly)
+                t = float(si.t) - 0.01
                 position = position + t * direction
 
-                # The reflected direction is calculated in the z plane
-                n = np.array(si.n)
-                n = [n[1], -n[0], 0.0]
+                # Reflect in z-plane
+                n = np.array(si.n, dtype=float)
+                n = np.array([n[1], -n[0], 0.0], dtype=float)
                 n = n / np.linalg.norm(n)
-                direction = - (direction - 2 * np.dot(direction, n) * n)
+                direction = -(direction - 2 * np.dot(direction, n) * n)
 
                 velocity = direction * speed
                 distance -= t
                 delay_left -= (t / speed) * 1e9
-
-                # For testing
-                # print(f"CourseChange x = {position[0]}, y = {position[1]}, z = {position[2]}")
-
             else:
-                # If the ray does not hit an object, calculate the next position
                 break
 
         next_position = position + (velocity * delay_left / 1e9)
 
         self.node_info_dict[node_id]["velocity"] = velocity.tolist()
         self.node_info_dict[node_id]["position"] = next_position.tolist()
-
-        # Set the mitsuba variant back to how Sionna configures it
-        if len(gpus) > 0:
-            mi.set_variant('cuda_ad_rgb')
-        else:
-            mi.set_variant('llvm_ad_rgb')
 
 
     def remove_all_cached_entries(self, simulation_time):
