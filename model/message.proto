@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package ns3sionna;
+
+// Definition of messages used for IPC between NS3 and Sionna
+// author: Pilz, Zubow
+
+message SimInitMessage {
+    string scene_fname = 1; // the scene to be loaded
+    int32 seed = 2; // random seed
+    uint32 frequency = 3; // the center frequency in MHz
+    uint32 channel_bw = 4; // OFDM channel bandwidth in MHz
+    uint32 fft_size = 5; // size of FFT
+    uint32 subcarrier_spacing = 6; // OFDM subcarrier spacing in Hz
+    int32 mode = 7; // mode of operation: -1=not set, 1=P2P, 2=P2MP, 3=P2MP+lookahead
+    int32 sub_mode = 8; // used in mode=3: max. no of parallel links to be computed in single call to Sionna, -1 if ignored
+    uint32 min_coherence_time_ms = 9; // minimal coherence time in milliseconds
+    string time_evo_model = 10; // time evolution model: 'doppler', 'position', 'hybrid'
+
+    // each node is defined by ID, location and mobility model
+    message NodeInfo {
+        uint32 id = 1;
+        
+        message Vector {
+            double x = 1;
+            double y = 2;
+            double z = 3;
+        }
+        
+        // --- the mobility model --- //
+
+        // fixed position
+        message ConstantPositionModel {
+            Vector position = 1;
+        }
+
+        // random walk with given distribution for speed (contant, uniform, normal)
+        message RandomWalkModel {
+            Vector position = 1;
+            
+            oneof mode {
+                uint32 wall_value = 2;
+                int64 time_value = 3;
+                double distance_value = 4;
+            }
+
+            message RandomVariableStream {
+                message Constant {
+                    double value = 1;
+                }
+
+                message Uniform {
+                    double min = 1;
+                    double max = 2;
+                }
+
+                message Normal {
+                    double mean = 1;
+                    double variance = 2;
+
+                }
+                oneof distribution {
+                    Constant constant = 1;
+                    Uniform uniform = 2;
+                    Normal normal = 3;
+                }
+            }
+
+            RandomVariableStream speed = 5;
+            RandomVariableStream direction = 6;
+        }
+
+        oneof model {
+            ConstantPositionModel constant_position_model = 2;
+            RandomWalkModel random_walk_model = 3;
+        }
+    }
+
+    repeated NodeInfo nodes = 11;
+}
+
+// sent my Sioanna to confirm reception of SimInitMessage or CloseRequest
+message SimAck {
+    bool no_error = 1; // indicates whether the processing was successful or not
+    string error_msg = 2; // the error message in case of an error
+}
+
+// send my NS3 to ask Sionna about current channel condition
+message ChannelStateRequest {
+    // get channel between tx_node and at least rx_node at sim time
+    uint32 tx_node = 1; // TX node ID
+    uint32 rx_node = 2; // RX node ID
+    uint64 time = 3; // simulation time (in ns)
+}
+
+message ChannelStateResponse {
+    message ChannelState {
+        // validity of this data
+        uint64 start_time = 1; // simulation time (in ns)
+        uint64 end_time = 2; // simulation time (in ns)
+
+        // info for the tx node
+        message TxNodeInfo {
+            uint32 id = 1;
+
+            message Vector {
+                double x = 1;
+                double y = 2;
+                double z = 3;
+            }
+
+            Vector position = 2;
+        }
+
+        // info for each rx node
+        message RxNodeInfo {
+            uint32 id = 1;
+
+            message Vector {
+                double x = 1;
+                double y = 2;
+                double z = 3;
+            }
+
+            Vector position = 2;
+
+            uint64 delay = 3; // propagation delay of shortest path (in ns)
+            double wb_loss = 4; // wideband propgation loss (in dB)
+
+            // OFDM subcarrier frequencies relative to fc0
+            repeated int32 frequencies = 5;
+            // complex CSI per OFDM subcarrier
+            repeated double csi_real = 6;
+            repeated double csi_imag = 7;
+            // max validity for that link
+            uint64 end_time2 = 8; // simulation time (in ns)
+        }
+
+        TxNodeInfo tx_node = 3;
+        repeated RxNodeInfo rx_nodes = 4;
+    }
+
+    // future CSI
+    repeated ChannelState csi = 1;
+}
+
+// shutdown Sionna
+message SimCloseRequest {
+}
+
+message Wrapper {
+    oneof msg {
+        SimInitMessage sim_init_msg = 1;
+        SimAck sim_ack = 2;
+        ChannelStateRequest channel_state_request = 3;
+        ChannelStateResponse channel_state_response = 4;
+        SimCloseRequest sim_close_request = 5;
+    }
+}

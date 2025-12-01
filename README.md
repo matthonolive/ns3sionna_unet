@@ -1,15 +1,15 @@
 ns3sionna
 ============
 
-<img src="./res/ns3sionna_logo_small_sw.jpg" width="15%" alt="Logo" style="text-align: left; vertical-align: middle;">
+<img src="./doc/img/ns3sionna_logo_small_sw.jpg" width="15%" alt="Logo" style="text-align: left; vertical-align: middle;">
 
-ns3sionna is a software module that brings realistic channel simulation using ray tracing from 
+ns3sionna is a software module that brings realistic channel simulation using ray tracing from
 Sionna (https://nvlabs.github.io/sionna/) to the widely used ns-3 network simulator (https://github.com/nsnam).
 
 <table style="width:70%">
 <tr>
-<td><img src="./res/munich2.png" width="75%" alt="Outdoor scenario: area around Frauenkirche in Munich" style="text-align: center; vertical-align: middle;"></td>
-<td><img src="./res/ex2_munich_paper.jpg" width="90%" alt="Results for outdoor scenario: trajectory of STA, CSI, Prx over time, distance vs. Prx." style="text-align: center; vertical-align: middle;"></td>
+<td><img src="./doc/img/munich2.png" width="75%" alt="Outdoor scenario: area around Frauenkirche in Munich" style="text-align: center; vertical-align: middle;"></td>
+<td><img src="./doc/img/ex2_munich_paper.jpg" width="90%" alt="Results for outdoor scenario: trajectory of STA, CSI, Prx over time, distance vs. Prx." style="text-align: center; vertical-align: middle;"></td>
 </tr>
 <tr>
 <td>Outdoor scenario (Munich)</td>
@@ -25,7 +25,19 @@ Installation
 
 We recommend using Linux (e.g. Ubuntu 22 or higher) and a multi-core/GPU compute node.
 
-1. Download ns3
+0. Install all dependencies required by ns-3 and those needed by our framework: ZMQ, Protocol Buffers:
+
+```
+apt-get update
+apt-get install gcc g++ python3 python3-pip cmake
+apt-get install libzmq5 libzmq5-dev
+apt-get install libprotobuf-dev
+apt-get install protobuf-compiler
+apt-get install pkg-config
+
+```
+
+1. Download and install ns3
 
 ```
 wget https://www.nsnam.org/releases/ns-allinone-3.40.tar.bz2
@@ -33,58 +45,78 @@ tar xf ns-allinone-3.40.tar.bz2
 cd ns-allinone-3.40
 ```
 
-2. Download ns3-sionna
+2. Clone ns3sionna repository into contrib directory of ns3:
 
 ```
-git clone https://github.com/tkn-tub/ns3sionna.git
-cd ns3sionna/
-./install_packages.sh
-./bootstrap.sh
+cd ./ns-3.40/contrib
+git clone https://github.com/tkn-tub/ns3sionna.git ./sionna
 ```
 
-3. Build everything in ns3
+Note: it is important to use the sionna as the name of the ns3sionna app directory.
+
+3. Configure and build ns-3 project:
+
 ```
-cd ../ns-3.40/
-./ns3 configure -d debug --enable-examples
+cd ../
+./ns3 configure --enable-examples
 ./ns3 build
 ```
 
-4. Build sionna server
+Note: ns3sionna Protocol Buffer messages (C++ and Python) are build during configure.
+
+4. Install server component of ns3sionna located in model/ns3sionna (Python3 required)
+
 ```
-cd ../ns3sionna/sionna_server/
+cd ./contrib/sionna/model/ns3sionna/
 python3 -m venv sionna-venv
 source sionna-venv/bin/activate
-python3 -m pip install -r requirements.txt # or requirements_gpu.txt if you want to use GPUs
-python3 test_imports.py # all packages should be correctly installed
+python3 -m pip install -r requirements.txt
+python3 tests/test_imports.py # all packages should be correctly installed
 ```
 
-5. Start sionna server
+or using conda:
+
 ```
-cd ./ns3sionna/sionna_server/
-source sionna-venv/bin/activate
-python3 sionna_server.py
+cd ./contrib/sionna/model/ns3sionna/
+conda create -n sionna-venv python=3.12
+conda activate sionna-venv
+pip install -r requirements.txt
+python3 tests/test_imports.py # all packages should be correctly installed
 ```
 
-5. Start a ns-3 example script
+Note: ns3sionna was tested with Sionna==1.2.1.
+
+5. Start server component of ns3sionna
+
 ```
-cd ns-3.40/
-./ns3 run scratch/ns3-sionna/example-sionna-sensing-mobile
+cd ./contrib/sionna/model/ns3sionna
+./run.sh
 ```
 
-6. Plot the results
+Note: if you experience problems with Protocol Buffers use:
+
 ```
-cd ns-3.40/
-python3 ./scratch/ns3-sionna/plot3d_mobile_csi.py example-sionna-sensing-mobile.csv example-sionna-sensing-mobile-pathloss.csv example-sionna-sensing-mobile-time-pos.csv
+run_python_proto.sh
 ```
+
+
+5. Start a ns-3 example script (in separate terminal)
+```
+cd ns-3.40/contrib/sionna/examples
+./example-sionna-sensing-mobile.sh
+```
+
+Note: you need to have matplotlib installed to see the results.
 
 Examples
 ========
 
-All examples can be found [here](./ns3-sionna/).
+All examples can be found [here](./examples/).
 
 Current limitations
 ========
 * SISO only
+* under development: MIMO
 
 Contact
 ============
