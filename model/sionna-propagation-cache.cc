@@ -14,7 +14,6 @@
 #include "ns3/log.h"
 #include "ns3/node.h"
 #include "ns3/simulator.h"
-#include <boost/units/physical_dimensions/volume.hpp>
 #include <sstream>
 
 namespace ns3
