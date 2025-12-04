@@ -391,10 +391,10 @@ class SionnaEnv:
                          specular_reflection=self.rt_specular_reflection,  # Can rays bounce off surfaces?
                          diffuse_reflection=self.rt_diffuse_reflection,
                          refraction=self.rt_refraction,  # Can rays pass through materials?
-                         synthetic_array=self.rt_synthetic_array)
-                         #diffraction=self.rt_diffraction,  # costly
-                         #edge_diffraction=self.rt_edge_diffraction,  # rays that bend around edges
-                         #diffraction_lit_region=self.rt_diffraction_lit_region)  # higher physical accuracy
+                         synthetic_array=self.rt_synthetic_array,
+                         diffraction=self.rt_diffraction,  # costly
+                         edge_diffraction=self.rt_edge_diffraction,  # rays that bend around edges
+                         diffraction_lit_region=self.rt_diffraction_lit_region)  # higher physical accuracy
 
         # AZU: sampling_frequency is only used if num_time_steps > 1
         # a: shape [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps],
