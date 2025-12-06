@@ -19,14 +19,14 @@ faulthandler.dump_traceback_later(10, repeat=False)  # after 10s, if not removed
 
 '''
     Unittest for testing the server component of ns3sionna
-    
+
     author: Zubow
 '''
 class TestServer(unittest.TestCase):
 
     def setUp(self):
         # This runs before every test
-        self.env = SionnaEnv(rt_fast=False, VERBOSE=True)
+        self.env = SionnaEnv(model_folder='./models/', rt_fast=False, rt_max_parallel_links=8, VERBOSE=True)
 
         cwd = os.getcwd()
         print("Running unittest in current wdir:", cwd)
@@ -41,7 +41,7 @@ class TestServer(unittest.TestCase):
         print(f"{self.id()} took {elapsed:.4f} seconds")
 
 
-    def _create_sim_init_constant_mob(self, mode=3):
+    def _create_sim_init_constant_mob(self, mode=SionnaEnv.MODE_P2MP_LAH):
         sim_info = message_pb2.Wrapper()
         sim_info.sim_init_msg.scene_fname               = "2_rooms_with_door/2_rooms_with_door_open.xml"
         sim_info.sim_init_msg.seed                      = 42
@@ -69,7 +69,7 @@ class TestServer(unittest.TestCase):
         return sim_info
 
 
-    def _create_sim_init_wall_mob(self, mode=3, num_mobile_nodes=1):
+    def _create_sim_init_wall_mob(self, mode=SionnaEnv.MODE_P2MP_LAH, num_mobile_nodes=1):
         sim_info = message_pb2.Wrapper()
         sim_info.sim_init_msg.scene_fname               = "simple_room/simple_room_open.xml"
         sim_info.sim_init_msg.seed                      = 42
@@ -78,7 +78,7 @@ class TestServer(unittest.TestCase):
         sim_info.sim_init_msg.fft_size                  = 256
         sim_info.sim_init_msg.subcarrier_spacing        = 78125
         sim_info.sim_init_msg.mode                      = mode #1
-        sim_info.sim_init_msg.sub_mode                  = 4 #1
+        sim_info.sim_init_msg.sub_mode                  = 8 #1
         sim_info.sim_init_msg.min_coherence_time_ms     = 100000
         sim_info.sim_init_msg.time_evo_model            = 'position'
 
@@ -126,21 +126,37 @@ class TestServer(unittest.TestCase):
         return sim_info
 
 
-    @unittest.skip("Not yet")
+    #@unittest.skip("Not yet")
     def test_init(self):
         '''
-        Test initialization phase for all 3 modes
-        :return:
+        Test just initialization phase in mode 1
         '''
-        for mode in [SionnaEnv.MODE_P2P]: #, SionnaEnv.MODE_P2MP, SionnaEnv.MODE_P2MP_LAH]:
-            sim_init_msg = self._create_sim_init_constant_mob(mode=mode).sim_init_msg
-            successful, error_msg = self.env.init_simulation_env(sim_init_msg)
-            self.assertTrue(successful, error_msg)
+        mode = SionnaEnv.MODE_P2P
+        sim_init_msg = self._create_sim_init_constant_mob(mode=mode).sim_init_msg
+        successful, error_msg = self.env.init_simulation_env(sim_init_msg)
+        self.assertTrue(successful, error_msg)
+
+
+    #@unittest.skip("Not yet")
+    def test_mode_p2mp_lah(self):
+
+        '''
+        Test just initialization phase in mode 3
+        '''
+
+        N = 3 # no. of mobile nodes
+        sim_init_msg = self._create_sim_init_wall_mob(mode=SionnaEnv.MODE_P2MP_LAH, num_mobile_nodes=N).sim_init_msg
+
+        successful, error_msg = self.env.init_simulation_env(sim_init_msg)
+        self.assertTrue(successful, error_msg)
 
 
     #@unittest.skip("Not yet")
     def test_get_csi(self):
-        sim_init_msg = self._create_sim_init_constant_mob(mode=1).sim_init_msg
+        '''
+        Test get single CSI in static scenario with TX and RX nodes
+        '''
+        sim_init_msg = self._create_sim_init_constant_mob(mode=SionnaEnv.MODE_P2P).sim_init_msg
 
         successful, error_msg = self.env.init_simulation_env(sim_init_msg)
         self.assertTrue(successful, error_msg)
@@ -150,18 +166,48 @@ class TestServer(unittest.TestCase):
         self.env.compute_cfr(csi_req, csi_resp)
 
 
-    @unittest.skip("Not yet")
+    #@unittest.skip("Not yet")
+    def test_get_csi_mode3(self):
+        '''
+        Test scenario with fixed TX and two mobile RX nodes; use mode 3
+        '''
+        sim_init_msg = self._create_sim_init_wall_mob(mode=SionnaEnv.MODE_P2MP_LAH, num_mobile_nodes=2).sim_init_msg
+
+        successful, error_msg = self.env.init_simulation_env(sim_init_msg)
+        self.assertTrue(successful, error_msg)
+
+        csi_req = self._create_channel_state_request(time=0).channel_state_request
+        csi_resp = self._create_channel_state_response()
+        self.env.compute_cfr(csi_req, csi_resp)
+
+        prev_entry = None
+        for csi_id in range(len(csi_resp.channel_state_response.csi)):
+            csi_entry = csi_resp.channel_state_response.csi[csi_id]
+
+            for rx_id in range(len(csi_entry.rx_nodes)):
+                rx_entry = csi_entry.rx_nodes[rx_id]
+                print(f'CSI: {csi_entry.start_time} - {csi_entry.end_time}: {csi_entry.tx_node.id} - {rx_entry.id} -> loss: {rx_entry.wb_loss}')
+
+            # check start_time and end_time values
+            if prev_entry is not None:
+                assert prev_entry.end_time + 1 == csi_entry.start_time
+
+            prev_entry = csi_entry
+
+
+    #@unittest.skip("Not yet")
     def test_random_wall(self):
-        sim_init_msg = self._create_sim_init_wall_mob().sim_init_msg
+        '''
+        Test scenario with fixed TX and mobile RX with wall mobility
+        '''
+        sim_init_msg = self._create_sim_init_wall_mob(mode=SionnaEnv.MODE_P2P).sim_init_msg
 
         successful, error_msg = self.env.init_simulation_env(sim_init_msg)
         self.assertTrue(successful, error_msg)
 
         time_arr = np.arange(50 * MILLISECOND, 2 * SECOND, 50 * MILLISECOND)
 
-        csi_ts = []
-        wb_loss = []
-        delay = []
+        csi_ts, wb_loss, delay = [], [], []
         for time in time_arr:
             csi_req = self._create_channel_state_request(time).channel_state_request
             csi_resp = self._create_channel_state_response()
@@ -208,15 +254,15 @@ class TestServer(unittest.TestCase):
             plt.tight_layout()
             plt.show()
 
-    @unittest.skip("Not yet")
+    #@unittest.skip("Not yet")
     def test_multi_user(self):
 
         '''
-        Node 0 transmits to node 1; testing piggybacking of P2MP
+        Node 0 transmits to node 1; testing piggybacking of P2MP mode
         '''
 
         N = 3 # no. of mobile nodes
-        sim_init_msg = self._create_sim_init_wall_mob(mode=2, num_mobile_nodes=N).sim_init_msg
+        sim_init_msg = self._create_sim_init_wall_mob(mode=SionnaEnv.MODE_P2MP, num_mobile_nodes=N).sim_init_msg
 
         successful, error_msg = self.env.init_simulation_env(sim_init_msg)
         self.assertTrue(successful, error_msg)
@@ -293,22 +339,13 @@ class TestServer(unittest.TestCase):
             plt.tight_layout()
             plt.show()
 
-    @unittest.skip("Not yet")
-    def test_mode_p2mp_lah(self):
 
-        '''
-        Node 0 transmits to node 1; testing speculative channel computation
-        '''
-
-        N = 3 # no. of mobile nodes
-        sim_init_msg = self._create_sim_init_wall_mob(mode=3, num_mobile_nodes=N).sim_init_msg
-
-        successful, error_msg = self.env.init_simulation_env(sim_init_msg)
-        self.assertTrue(successful, error_msg)
-
-
-    @unittest.skip("Not yet")
+    #@unittest.skip("Not yet")
     def test_coherence_time_mode1(self):
+        '''
+        Test computation of coherence time in mode 1
+        :return:
+        '''
         K = 1 # one mobile user
         sim_init_msg = self._create_sim_init_wall_mob(mode=SionnaEnv.MODE_P2P, num_mobile_nodes=K).sim_init_msg
 

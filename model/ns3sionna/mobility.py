@@ -21,10 +21,8 @@ class AbstractMobility(ABC):
         self.collect_history = collect_history
 
         if self.collect_history:
-            self.time_history = []
-            self.pos_history = []
-            self.pos_history.append(pos)
-            self.time_history.append(0)
+            self.pos_history = {} # time -> pos
+            self.velo_history = {}  # time -> velocity
 
 
     def update_pos(self, sim_time, pos, velocity, hit_wall):
@@ -35,8 +33,18 @@ class AbstractMobility(ABC):
         self.hit_wall = hit_wall
 
         if self.collect_history:
-            self.pos_history.append(pos)
-            self.time_history.append(sim_time)
+            self.pos_history[sim_time] = pos
+            self.velo_history[sim_time] = velocity
+
+
+    @abstractmethod
+    def get_pos_at(self, req_time):
+        pass
+
+
+    @abstractmethod
+    def get_velo_at(self, req_time):
+        pass
 
 
     @abstractmethod
@@ -60,11 +68,21 @@ class ConstantMobility(AbstractMobility):
     def __init__(self, node_id, pos, collect_history=True):
         super(ConstantMobility, self).__init__(node_id, pos, collect_history)
 
+
     def get_next_direction_angle(self):
         return 0.0
 
+
     def check_set_new_velocity(self, sim_time, distance):
         pass
+
+
+    def get_pos_at(self, req_time):
+        return self.pos
+
+
+    def get_velo_at(self, req_time):
+        return self.velocity
 
 
 class RandomWalkMobility(AbstractMobility):
@@ -104,6 +122,14 @@ class RandomWalkMobility(AbstractMobility):
 
         # init with some speed and direction
         self._set_new_velocity()
+
+
+    def get_pos_at(self, req_time):
+        return self.pos_history[req_time]
+
+
+    def get_velo_at(self, req_time):
+        return self.velo_history[req_time]
 
 
     def _set_new_velocity(self, ts=0):

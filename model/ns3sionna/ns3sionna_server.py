@@ -29,8 +29,11 @@ from mobility import *
 
 class SionnaEnv:
 
+    # just compute the given single point-to-point channel
     MODE_P2P        = 1
+    # extend the given P2P channel to include all receivers to take broadcast nature of wireless into account
     MODE_P2MP       = 2
+    # compute also future channels; used only if the transmitter is static (receivers are mobile)
     MODE_P2MP_LAH   = 3
 
     """
@@ -39,7 +42,7 @@ class SionnaEnv:
 
     author: Pilz, Zubow
     """
-    def __init__(self, model_folder='./models/', rt_fast=False, default_mode=MODE_P2P, rt_max_parallel_links=32, est_csi=True, VERBOSE=True,
+    def __init__(self, model_folder='./models/', rt_fast=False, default_mode=MODE_P2P, rt_max_parallel_links=256, est_csi=True, VERBOSE=True,
                  CHECKS_ENABLED=True):
         self.model_folder = model_folder
         self.rt_fast = rt_fast
@@ -192,6 +195,220 @@ class SionnaEnv:
 
 
     def compute_cfr(self, csi_req, reply_wrapper):
+
+        tx_node_id = csi_req.tx_node
+        # check if transmitter is fixed
+        fixed_tx_node = isinstance(self.node_info[tx_node_id], ConstantMobility)
+
+        if self.mode == SionnaEnv.MODE_P2MP_LAH and fixed_tx_node:
+            # mode=3 is feasible if TX is fixed
+            self.compute_cfr_with_lookahead(csi_req, reply_wrapper)
+        else:
+            req_mode = self.mode
+            # mode=1/2 or if TX node is mobile
+            if self.mode == SionnaEnv.MODE_P2MP_LAH:
+                req_mode = SionnaEnv.MODE_P2MP
+                print(f'Fallback to mode={req_mode} as TX node is mobile')
+
+            self.compute_cfr_classic(csi_req, reply_wrapper, req_mode)
+
+
+    def compute_cfr_with_lookahead(self, csi_req, reply_wrapper):
+        '''
+        Compute the requested CFR
+        :param csi_req: received CSI request (ZMQ)
+        :param reply_wrapper: the response
+        '''
+
+        if self.VERBOSE:
+            print_csi_request(csi_req)
+
+        tx_node_id = csi_req.tx_node
+        rx_node_id = csi_req.rx_node # this rx node must be included in result set
+        req_sim_time = csi_req.time # we need CFR at that point in time [ns]
+
+        assert self.time_evo_model == 'position'
+
+        # execute mobility
+
+        # update position of all nodes
+        nodes_to_update = list(self.node_info.keys())
+
+        # compute look-ahead
+        look_ahead = math.floor(self.rt_max_parallel_links / (len(nodes_to_update) - 1))
+
+        print(f'compute CFR to #RX={len(nodes_to_update) - 1} with LAH={look_ahead}')
+
+        # sim future node positions
+        lah_time_vec = []
+        for lah_i in range(look_ahead):
+            # move in time
+            dt = req_sim_time - self.sim_time
+
+            csi_tc_arr = []
+            for node_id in nodes_to_update:
+                # perform walk
+                self._walk(node_id, dt)
+                if node_id != tx_node_id:
+                    tc = coherence_from_velocities(self.node_info[node_id].velocity,
+                                                    self.node_info[tx_node_id].velocity, self.fc,
+                                                    pos_tx=self.node_info[node_id].pos,
+                                                    pos_rx=self.node_info[tx_node_id].pos)
+                    csi_tc_arr.append(tc)
+
+            # take the worst case Tc from all RX nodes
+            Tc_p2mp = int(np.min(np.asarray(csi_tc_arr)))
+
+            # update time
+            self.sim_time = req_sim_time
+            lah_time_vec.append(req_sim_time)
+            # new req time is old + Tc
+            req_sim_time = req_sim_time + Tc_p2mp
+
+
+        # place TX and RX nodes together with their future positions
+        rx_nodes = nodes_to_update
+        rx_nodes.remove(tx_node_id)
+
+        self._place_tx_rx_nodes_with_lah(lah_time_vec, tx_node_id, rx_nodes)
+
+        # create pathsolver; todo: check reuse
+        p_solver  = PathSolver()
+
+        # Compute propagation paths
+        paths = p_solver(scene=self.scene,
+                         max_depth=self.rt_max_depth,
+                         samples_per_src=self.rt_samples_per_src,
+                         los=self.rt_los,
+                         specular_reflection=self.rt_specular_reflection,  # Can rays bounce off surfaces?
+                         diffuse_reflection=self.rt_diffuse_reflection,
+                         refraction=self.rt_refraction,  # Can rays pass through materials?
+                         synthetic_array=self.rt_synthetic_array,
+                         diffraction=self.rt_diffraction,  # costly
+                         edge_diffraction=self.rt_edge_diffraction,  # rays that bend around edges
+                         diffraction_lit_region=self.rt_diffraction_lit_region)  # higher physical accuracy
+
+        # AZU: sampling_frequency is only used if num_time_steps > 1
+        # a: shape [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps],
+        a, tau = paths.cir(sampling_frequency=1e9, normalize_delays=False, out_type="numpy")
+
+        # shape: [num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_subcarriers]
+        h_raw = paths.cfr(frequencies=self.frequencies,
+                  sampling_frequency=1.0,  # not used
+                  num_time_steps=1,
+                  normalize_delays=True,
+                  # If set to True, path delays are normalized such that the first path between any pair of
+                  # antennas of a transmitter and receiver arrives at tau=0
+                  normalize=False,  # Normalize energy
+                  out_type="numpy")
+
+        # max single transmitter
+        assert h_raw.shape[2] == 1
+
+        # Create ZMQ response
+        chan_response = reply_wrapper.channel_state_response
+
+        for lah_time_idx, lah_time in enumerate(lah_time_vec): # iterate over time
+            csi = chan_response.csi.add()
+
+            csi.start_time = lah_time
+            # tx node is fixed
+            tx_pos = self.node_info[tx_node_id].pos
+            csi.tx_node.id = tx_node_id
+            csi.tx_node.position.x = tx_pos[0]
+            csi.tx_node.position.y = tx_pos[1]
+            csi.tx_node.position.z = tx_pos[2]
+
+            # get receiver(s)
+            csi_tc_arr = []
+            for curr_rx_id, curr_rx_node in enumerate(rx_nodes):
+
+                rx_id = lah_time_idx * len(rx_nodes) + curr_rx_id
+
+                lnk_tau = np.squeeze(tau[rx_id, :, :, :, :])
+                lnk_delay = int(round(np.min(lnk_tau[lnk_tau >= 0] * 1e9), 0))
+
+                h = np.squeeze(h_raw[rx_id, :, :, :, :, ])
+
+                # see Parseval's theorem
+                lnk_loss = float(-10 * np.log10(np.mean(np.abs(h) ** 2)))
+
+                # for frequency-selective channel
+                power = np.mean(np.abs(h) ** 2)  # shape [batch_size, 1, 1, 1]
+
+                h_normalized = h / np.sqrt(power)
+
+                # plausibility test
+                if self.CHECKS_ENABLED:
+                    power_normalized = np.mean(np.abs(h_normalized) ** 2)
+                    assert math.isclose(power_normalized, 1.0, rel_tol=1e-3)   # Should be close to 1
+
+                if self.VERBOSE:
+                    print(f'{lah_time/1e9}s: {tx_node_id}->{curr_rx_node} lnk_delay = {lnk_delay}ns, wb_loss = {lnk_loss:.3f}dB, CFR shape: {h_normalized.shape}')
+
+                rx_node_info = csi.rx_nodes.add()
+                rx_pos = self.node_info[curr_rx_node].get_pos_at(lah_time)
+                rx_node_info.id = curr_rx_node
+                rx_node_info.position.x = rx_pos[0]
+                rx_node_info.position.y = rx_pos[1]
+                rx_node_info.position.z = rx_pos[2]
+                rx_node_info.delay = lnk_delay
+                rx_node_info.wb_loss = lnk_loss
+
+                if self.est_csi:
+                    rx_node_info.frequencies.extend(self.frequencies.tolist())
+                    rx_node_info.csi_imag.extend(np.imag(h_normalized).tolist())
+                    rx_node_info.csi_real.extend(np.real(h_normalized).tolist())
+
+                tc = coherence_from_velocities(self.node_info[curr_rx_node].get_velo_at(lah_time),
+                                                self.node_info[tx_node_id].velocity, self.fc,
+                                                pos_tx=self.node_info[curr_rx_node].get_pos_at(lah_time),
+                                                pos_rx=self.node_info[tx_node_id].pos)
+
+                rx_node_info.end_time2 = csi.start_time + tc
+                csi_tc_arr.append(tc)
+
+            # take the worst case Tc from all RX nodes
+            Tc_p2mp = int(np.min(np.asarray(csi_tc_arr)))
+            csi.end_time = csi.start_time + Tc_p2mp - 1 # -1ns to have non-overlapping intervals
+
+
+
+    def _place_tx_rx_nodes_with_lah(self, lah_time_vec: list, tx_node: int, rx_nodes: list):
+        '''
+        Place the given nodes together with their lookahead positions in the scenario
+        :param lah_time_vec: time vector containing the lah time vector
+        :param tx_node: the transmitting node
+        :param rx_nodes: the receiver nodes
+        '''
+
+        # remove old tx and rx nodes
+        for placed_node in self.placed_radio_node_names:
+            self.scene.remove(placed_node)
+        self.placed_radio_node_names.clear()
+
+        # only supported if TX is fixed
+        fixed_tx_node = isinstance(self.node_info[tx_node], ConstantMobility)
+        assert fixed_tx_node
+
+        # Create transmitter
+        tx_pos = self.node_info[tx_node].pos
+        tx_node_name = "tx"
+        tx = Transmitter(name=tx_node_name, position=tx_pos, orientation=[0, -180, 0], display_radius=self.disp_r)
+        self.scene.add(tx)
+        self.placed_radio_node_names.append(tx_node_name)
+
+        for lah_time_idx, lah_time in enumerate(lah_time_vec):
+            # Create a receiver(s)
+            for rx_node_i in rx_nodes:
+                rx_node_name = "rx" + str(rx_node_i) + "." + str(lah_time_idx)
+                rx_pos = self.node_info[rx_node_i].get_pos_at(lah_time)
+                rx = Receiver(name=rx_node_name, position=rx_pos, orientation=[0, -180, 0], display_radius=self.disp_r)
+                self.scene.add(rx)
+                self.placed_radio_node_names.append(rx_node_name)
+
+
+    def compute_cfr_classic(self, csi_req, reply_wrapper, req_mode):
         '''
         Compute the requested CFR
         :param csi_req: received CSI request (ZMQ)
@@ -209,7 +426,7 @@ class SionnaEnv:
             #(lnk_delay, lnk_loss, h_normalized) = self.compute_cfr_via_doppler()
             pass
         else: # position=based
-            (rx_nodes, lnk_delay, lnk_loss, h_normalized) = self._compute_cfr_via_position(req_sim_time, tx_node_id, rx_node_id)
+            (rx_nodes, lnk_delay, lnk_loss, h_normalized) = self._compute_cfr_via_position(req_sim_time, tx_node_id, rx_node_id, req_mode)
 
         # Create ZMQ response
         chan_response = reply_wrapper.channel_state_response
@@ -350,7 +567,7 @@ class SionnaEnv:
             self.placed_radio_node_names.append(rx_node_name)
 
 
-    def _compute_cfr_via_position(self, req_sim_time, tx_node, rx_node):
+    def _compute_cfr_via_position(self, req_sim_time, tx_node, rx_node, req_mode):
         '''
         Compute the link propagation delay, wideband loss and normalized CFR
         :param req_sim_time: current simulation time
@@ -363,7 +580,7 @@ class SionnaEnv:
         dt = req_sim_time - self.sim_time
 
         # estimate the node we need to update their position
-        if self.mode == SionnaEnv.MODE_P2P:
+        if req_mode == SionnaEnv.MODE_P2P:
             nodes_to_update = [tx_node, rx_node] # only TX and RX
         else:
             # both P2MP and P2MP_LAH
@@ -444,7 +661,9 @@ class SionnaEnv:
 
 
     def _get_mobility_history(self, node_id):
-        return self.node_info[node_id].time_history, self.node_info[node_id].pos_history
+        ts = sorted(self.node_info[node_id].pos_history.keys())
+        pos = [self.node_info[node_id].pos_history[t] for t in ts]
+        return ts, pos
 
 
     def _init_mobility(self, sim_init_msg):
@@ -544,7 +763,6 @@ class SionnaEnv:
                 start_time = time.time()
                 self.compute_cfr(ns3_msg.channel_state_request, resp_msg)
                 last_call_times.append(time.time() - start_time)
-                num_csi_req += 1
 
                 if self.VERBOSE:
                     avg_call_time = sum(last_call_times) / len(last_call_times)
@@ -578,7 +796,7 @@ if __name__ == '__main__':
     parser.add_argument("--single_run", help="Whether not to terminate after single run", action='store_true')
     parser.add_argument("--default_mode", type=int, default=SionnaEnv.MODE_P2MP, help="Which mode to use if not set by ns3")
     parser.add_argument("--rt_fast", help="Use simplified raytracing for faster computations", action='store_true')
-    parser.add_argument("--rt_max_parallel_links", type=int, default=4, help="Max no. of link simulated at once")
+    parser.add_argument("--rt_max_parallel_links", type=int, default=256, help="Max no. of link simulated at once; depends on GPU memory")
     parser.add_argument("--est_csi", help="Whether to estimate complex CSI per OFDM subcarrier", type=bool, default=True)
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
     args = parser.parse_args()
