@@ -197,10 +197,16 @@ class SionnaEnv:
     def compute_cfr(self, csi_req, reply_wrapper):
 
         tx_node_id = csi_req.tx_node
-        # check if transmitter is fixed
-        fixed_tx_node = isinstance(self.node_info[tx_node_id], ConstantMobility)
+        rx_node_id = csi_req.rx_node
 
-        if self.mode == SionnaEnv.MODE_P2MP_LAH and fixed_tx_node:
+        if self.mode == SionnaEnv.MODE_P2MP_LAH:
+            if isinstance(self.node_info[tx_node_id], RandomWalkMobility) and isinstance(self.node_info[rx_node_id], ConstantMobility):
+                # Exploit channel reciprocity - swap mobile TX with static RX
+                csi_req.tx_node = rx_node_id
+                csi_req.rx_node = tx_node_id
+
+        # check if mode 3 can be used
+        if self.mode == SionnaEnv.MODE_P2MP_LAH and isinstance(self.node_info[tx_node_id], ConstantMobility):
             # mode=3 is feasible if TX is fixed
             self.compute_cfr_with_lookahead(csi_req, reply_wrapper)
         else:
