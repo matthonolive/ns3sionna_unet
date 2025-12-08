@@ -129,6 +129,7 @@ class SionnaEnv:
         else:
             self.mode = self.default_mode # default mode
 
+        # todo: use submode
         if sim_init_msg.sub_mode > -1:
             self.sub_mode = sim_init_msg.sub_mode
         else:
@@ -142,6 +143,7 @@ class SionnaEnv:
 
         self.fc = sim_init_msg.frequency * 1e6
         self.fft_size = sim_init_msg.fft_size  # max FFT size
+        # todo: min Tc is not used
         self.min_coherence_time_ms = sim_init_msg.min_coherence_time_ms # min Tc
         self.subcarrier_spacing = sim_init_msg.subcarrier_spacing # in Hz
 
@@ -475,7 +477,7 @@ class SionnaEnv:
         # take the worst case Tc from all RX nodes
         Tc_p2mp = int(np.min(np.asarray(csi_tc_arr)))
 
-        print(f'Computed CSI with Tc: {round(Tc_p2mp / 1e6,2)}ms')
+        print(f'{self.sim_time / 1e9}s: Computed CSI with Tc: {round(Tc_p2mp / 1e6,2)}ms')
 
         csi.end_time = self.sim_time + Tc_p2mp
 
