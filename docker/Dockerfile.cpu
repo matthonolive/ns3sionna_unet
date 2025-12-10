@@ -1,0 +1,86 @@
+# CPU only
+FROM ubuntu:24.04
+
+LABEL Author="Anatolij Zubow, zubow@tkn.tu-berlin.de" \
+      Version="1.0"
+
+ENV LC_ALL=C.UTF-8 \
+    LANG=C.UTF-8
+
+# ----------------------------------------------------------------------
+# Base dependencies
+# ----------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget \
+        iputils-ping \
+        curl \
+        git \
+        nano \
+        build-essential \
+        ca-certificates \
+        libssl-dev \
+        libffi-dev \
+        libblas-dev \
+        liblapack-dev \
+        python3-venv \
+        cmake \
+        libzmq3-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y software-properties-common wget gnupg && \
+    add-apt-repository universe && \
+    apt-get update
+
+RUN apt-get install -y libzmq3-dev cppzmq-dev llvm-15 llvm-15-dev libclang-15-dev
+
+# ----------------------------------------------------------------------
+# Build and install protobuf v27.1
+# ----------------------------------------------------------------------
+WORKDIR /tmp
+RUN git clone --branch v27.1 --recursive https://github.com/protocolbuffers/protobuf.git protobuf-27.1 && \
+    cd protobuf-27.1 && \
+    mkdir build && cd build && \
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+             -DBUILD_SHARED_LIBS=ON \
+             -Dprotobuf_BUILD_TESTS=OFF && \
+    make -j"$(nproc)" && \
+    make install && \
+    ldconfig && \
+    rm -rf /tmp/protobuf-27.1
+
+# ----------------------------------------------------------------------
+# Install ns-3 and ns3sionna
+# ----------------------------------------------------------------------
+WORKDIR /opt
+RUN wget https://www.nsnam.org/releases/ns-allinone-3.40.tar.bz2 && \
+    tar xf ns-allinone-3.40.tar.bz2 && \
+    rm ns-allinone-3.40.tar.bz2
+
+# Clone ns3sionna contrib module
+RUN cd ns-allinone-3.40/ns-3.40/contrib && \
+    git clone https://github.com/tkn-tub/ns3sionna.git ./sionna
+
+# Build ns-3
+WORKDIR /opt/ns-allinone-3.40/ns-3.40
+RUN ./ns3 configure -d release --enable-examples && \
+    ./ns3 build
+
+# ----------------------------------------------------------------------
+# Set up Sionna Python environment
+# ----------------------------------------------------------------------
+WORKDIR /opt/ns-allinone-3.40/ns-3.40/contrib/sionna/model/ns3sionna
+
+RUN python3 -m venv /opt/sionna-venv && \
+    /bin/bash -c "source /opt/sionna-venv/bin/activate && \
+                  pip install --upgrade pip && \
+                  pip install -r requirements_cpuonly.txt"
+
+# ----------------------------------------------------------------------
+# Default command
+# ----------------------------------------------------------------------
+CMD echo "This is Ubuntu 24.04 + Python 3.12 container with ns3sionna framework installed." && \
+    echo "Run the server component: source /opt/sionna-venv/bin/activate ; cd /opt/ns-allinone-3.40/ns-3.40/contrib/sionna/model/ns3sionna/ ; ./run_python_proto.sh" && \
+    echo "Run an ns-3 example: cd /opt/ns-allinone-3.40/ns-3.40/ ; ./ns3 run ns3sionna-example-sionna-sensing-mobile" && \
+    /bin/bash
+

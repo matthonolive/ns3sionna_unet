@@ -116,7 +116,9 @@ All examples can be found [here](./examples/).
 Usage in HPC cluster
 ============
 
-See [here](singularity_howto.md)
+Using Docker [here](./docker/docker_howto.md)
+
+Using singularity [here](./singularity/singularity_howto.md)
 
 Current limitations
 ========
