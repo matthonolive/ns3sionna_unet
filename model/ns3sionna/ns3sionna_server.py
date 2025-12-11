@@ -17,6 +17,7 @@ import warnings
 import tensorflow as tf
 import mitsuba as mi
 import math
+from millify import millify
 
 from ns3sionna_utils import subcarrier_frequencies, compute_coherence_time, SECOND, MILLISECOND, coherence_from_velocities, \
     MAX_COHERENCE_TIME
@@ -210,7 +211,7 @@ class SionnaEnv:
         # check if mode 3 can be used
         if self.mode == SionnaEnv.MODE_P2MP_LAH and isinstance(self.node_info[tx_node_id], ConstantMobility):
             # mode=3 is feasible if TX is fixed
-            self.compute_cfr_with_lookahead(csi_req, reply_wrapper)
+            return self.compute_cfr_with_lookahead(csi_req, reply_wrapper)
         else:
             req_mode = self.mode
             # mode=1/2 or if TX node is mobile
@@ -218,7 +219,7 @@ class SionnaEnv:
                 req_mode = SionnaEnv.MODE_P2MP
                 print(f'Fallback to mode={req_mode} as TX node is mobile')
 
-            self.compute_cfr_classic(csi_req, reply_wrapper, req_mode)
+            return self.compute_cfr_classic(csi_req, reply_wrapper, req_mode)
 
 
     def compute_cfr_with_lookahead(self, csi_req, reply_wrapper):
@@ -385,6 +386,8 @@ class SionnaEnv:
 
         print(f'{self.sim_time / 1e9}s: Computed CSI with Tc: {np.round(np.asarray(Tc_p2mp_lah) / 1e6,2)}ms, #links: {num_computed_lnks}')
 
+        return num_computed_lnks
+
 
     def _place_tx_rx_nodes_with_lah(self, lah_time_vec: list, tx_node: int, rx_nodes: list):
         '''
@@ -484,6 +487,7 @@ class SionnaEnv:
         print(f'{self.sim_time / 1e9}s: Computed CSI with Tc: {round(Tc_p2mp / 1e6,2)}ms, #links: {len(rx_nodes)}')
 
         csi.end_time = self.sim_time + Tc_p2mp
+        return len(rx_nodes)
 
 
     def _walk(self, node_id, dt):
@@ -742,7 +746,7 @@ class SionnaEnv:
         print("Sionna server socket ready ...")
 
         last_call_times = deque(maxlen=10)
-        num_csi_req = 0
+        total_num_csi_samples = 0
 
         do_terminate = False
         while not do_terminate:
@@ -773,8 +777,12 @@ class SionnaEnv:
             elif ns3_msg.HasField("channel_state_request"):
                 # handle ChannelStateRequest by sending ChannelStateResponse
                 start_time = time.time()
-                self.compute_cfr(ns3_msg.channel_state_request, resp_msg)
+                num_csi_req = self.compute_cfr(ns3_msg.channel_state_request, resp_msg)
+                total_num_csi_samples += num_csi_req
                 last_call_times.append(time.time() - start_time)
+
+                if total_num_csi_samples % 1000 == 0: # every 1k make printout
+                    print(f'Total no. computed CSI samples: {millify(total_num_csi_samples)}')
 
                 if self.VERBOSE:
                     avg_call_time = sum(last_call_times) / len(last_call_times)
@@ -792,7 +800,7 @@ class SionnaEnv:
             socket.send(resp_msg.SerializeToString())
 
         socket.close()
-        print("Handled no. CSI req: %d" % num_csi_req)
+        print("Computed no. CSI samples: %d" % total_num_csi_samples)
         print("Sionna server socket closed.")
 
 
