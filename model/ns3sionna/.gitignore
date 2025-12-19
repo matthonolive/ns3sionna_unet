@@ -1,0 +1,4 @@
+
+# ML artifacts
+model/ns3sionna/runs/
+*.npy
