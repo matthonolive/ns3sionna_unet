@@ -8,7 +8,7 @@
   },
 
   "runtime": {
-    "device": "cpu",
+    "device": "cuda:0",
     "features": ["cost", "height_cond"],
 
     "grid": {
