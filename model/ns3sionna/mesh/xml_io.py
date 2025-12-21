@@ -1,201 +1,275 @@
+"""
+mesh/xml_io.py
+
+Minimal, robust Mitsuba XML exporter for Sionna RT scenes that:
+- Writes OBJ meshes to disk
+- Writes a Mitsuba XML scene that Sionna can load (sionna.rt.load_scene)
+- Uses explicit Sionna radio materials (itu-radio-material) so both:
+    (a) ns3sionna raytracer
+    (b) your UNet/cost-map pipeline that reads bsdf params
+  can agree on material behavior.
+
+Key design constraints:
+- DO NOT store Trimesh objects in mesh.metadata (causes deepcopy recursion)
+- DO NOT wrap radio materials in twosided (can break Sionna's radio_material detection)
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import xml.etree.ElementTree as ET
+from typing import Dict, Optional, Tuple
 
 import numpy as np
-import polars as pl
 import trimesh
-
-from mlink.scene import Scene
-from mlink.antenna import AntennaDatabase
+import xml.etree.ElementTree as ET
 
 
 # ----------------------------
-# Helpers
+# Material specs
 # ----------------------------
 
-def _triangulate_if_quads(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Mitsuba prefers triangles. Your walls_to_mesh() produces quads."""
-    if mesh.faces.ndim == 2 and mesh.faces.shape[1] == 4:
-        tri = trimesh.geometry.triangulate_quads(mesh.faces)
-        return trimesh.Trimesh(vertices=mesh.vertices.copy(), faces=tri, process=False)
-    return mesh
-
-
-def split_floor_ceiling_walls(mesh: trimesh.Trimesh, eps: float = 1e-6):
+@dataclass(frozen=True)
+class ItuRadioMaterialSpec:
     """
-    Split a mesh into (floor, ceiling, walls) by looking at face vertex z.
-    Works well for meshes created by walls_to_mesh() where floor/ceiling are flat.
+    ITU radio material as understood by Sionna RT via Mitsuba XML.
+
+    This matches Sionna's documented XML syntax:
+      <bsdf type="itu-radio-material" id="...">
+        <string name="type" value="concrete"/>
+        <float name="thickness" value="0.1"/>
+        <float name="scattering_coefficient" value="0.0"/>
+        <float name="xpd_coefficient" value="0.0"/>
+      </bsdf>
+
+    Notes:
+    - thickness is in meters
+    - scattering_coefficient and xpd_coefficient are optional but useful for future extensions
     """
-    m = mesh
-    z = m.vertices[:, 2]
-    zmin = float(z.min())
-    zmax = float(z.max())
-
-    fz = z[m.faces]  # (F,3) or (F,4)
-    is_floor = np.all(np.isclose(fz, zmin, atol=eps), axis=1)
-    is_ceil  = np.all(np.isclose(fz, zmax, atol=eps), axis=1)
-    is_wall  = ~(is_floor | is_ceil)
-
-    def submask(mask):
-        idx = np.nonzero(mask)[0]
-        if idx.size == 0:
-            return None
-        sm = m.submesh([idx], append=True, repair=False)
-        return _triangulate_if_quads(sm)
-
-    return submask(is_floor), submask(is_ceil), submask(is_wall)
-
-
-def _write_minimal_mitsuba_xml(
-    xml_path: Path,
-    shape_entries: list[tuple[str, str, str]],
-    # list of (shape_id, mesh_relpath, bsdf_id)
-):
-    """
-    Writes a Mitsuba XML file similar to ns3sionna examples.
-    """
-    xml_path.parent.mkdir(parents=True, exist_ok=True)
-
-    lines = []
-    lines.append('<scene version="2.1.0">')
-    lines.append('  <integrator type="path"><integer name="max_depth" value="12"/></integrator>')
-    lines.append('')
-
-    # Common ITU-ish materials (same ids as many ns3sionna scenes use)
-    # NOTE: These are "visual" diffuse colors; Sionna/ns3sionna often maps ids to radio materials.
-    lines.append('  <bsdf type="twosided" id="mat-itu_brick"><bsdf type="diffuse"><rgb name="reflectance" value="0.9 0.63 0.225"/></bsdf></bsdf>')
-    lines.append('  <bsdf type="twosided" id="mat-itu_concrete"><bsdf type="diffuse"><rgb name="reflectance" value="0.5 0.5 0.5"/></bsdf></bsdf>')
-    lines.append('')
-    lines.append('  <emitter type="constant" id="World"><rgb name="radiance" value="1 1 1"/></emitter>')
-    lines.append('')
-
-    for shape_id, rel_mesh, bsdf_id in shape_entries:
-        lines.append(f'  <shape type="obj" id="{shape_id}">')
-        lines.append(f'    <string name="filename" value="{rel_mesh}"/>')
-        lines.append('    <boolean name="face_normals" value="true"/>')
-        lines.append(f'    <ref name="bsdf" id="{bsdf_id}"/>')
-        lines.append('  </shape>')
-        lines.append('')
-
-    lines.append('</scene>')
-    xml_path.write_text("\n".join(lines), encoding="utf-8")
+    bsdf_id: str                 # e.g., "mat-itu_concrete"
+    itu_type: str                # e.g., "concrete", "brick", "glass", "metal", ...
+    thickness: float = 0.10
+    scattering_coefficient: float = 0.0
+    xpd_coefficient: float = 0.0
 
 
 # ----------------------------
-# Export: mesh -> (objs + xml)
+# Utilities
 # ----------------------------
 
-def export_mesh_as_ns3sionna_xml(
-    mesh: trimesh.Trimesh,
+def _indent_xml(elem: ET.Element, level: int = 0) -> None:
+    """Pretty-print indentation for ElementTree."""
+    i = "\n" + level * "  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        for child in elem:
+            _indent_xml(child, level + 1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = i
+
+
+def _safe_export_obj(mesh: trimesh.Trimesh, out_path: Path) -> None:
+    """
+    Export a Trimesh to OBJ robustly.
+    We also clear metadata to avoid any accidental deepcopy recursion.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Avoid recursive metadata graphs
+    try:
+        mesh.metadata = {}  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    mesh.export(out_path)
+
+
+def _faces_on_z_plane(mesh: trimesh.Trimesh, z: float, atol: float = 1e-6) -> np.ndarray:
+    """
+    Return a boolean mask over faces whose all vertices have z ~= given z.
+    """
+    v = np.asarray(mesh.vertices)
+    f = np.asarray(mesh.faces)
+    z_verts = v[f, 2]  # (F,3)
+    return np.all(np.isclose(z_verts, z, atol=atol), axis=1)
+
+
+def split_walls_floor_ceiling(mesh: trimesh.Trimesh, atol: float = 1e-6) -> Tuple[trimesh.Trimesh, trimesh.Trimesh, trimesh.Trimesh]:
+    """
+    Split a single mesh into (walls, floor, ceiling) by detecting the min-z and max-z planes.
+
+    This is designed to work with meshes like mlink.geometry.walls_to_mesh(), which
+    include floor/ceiling as planar faces.
+
+    Returns:
+        walls_mesh, floor_mesh, ceiling_mesh
+    """
+    v = np.asarray(mesh.vertices)
+    zmin = float(np.min(v[:, 2]))
+    zmax = float(np.max(v[:, 2]))
+
+    floor_mask = _faces_on_z_plane(mesh, zmin, atol=atol)
+    ceil_mask  = _faces_on_z_plane(mesh, zmax, atol=atol)
+    wall_mask  = ~(floor_mask | ceil_mask)
+
+    faces = np.asarray(mesh.faces)
+    parts = []
+    for mask in (wall_mask, floor_mask, ceil_mask):
+        part_faces = faces[mask]
+        if part_faces.shape[0] == 0:
+            # Empty mesh fallback
+            parts.append(trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64), process=False))
+        else:
+            # trimesh.submesh can copy metadata; keep it simple by rebuilding directly
+            used_verts = np.unique(part_faces.reshape(-1))
+            index_map = {old: new for new, old in enumerate(used_verts.tolist())}
+            new_vertices = v[used_verts]
+            new_faces = np.vectorize(index_map.get)(part_faces)
+            parts.append(trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False))
+
+    return parts[0], parts[1], parts[2]
+
+
+# ----------------------------
+# XML writing
+# ----------------------------
+
+def _add_itu_bsdf(scene_el: ET.Element, mat: ItuRadioMaterialSpec) -> None:
+    bsdf = ET.SubElement(scene_el, "bsdf", attrib={"type": "itu-radio-material", "id": mat.bsdf_id})
+    ET.SubElement(bsdf, "string", attrib={"name": "type", "value": str(mat.itu_type)})
+    ET.SubElement(bsdf, "float", attrib={"name": "thickness", "value": f"{float(mat.thickness):.6g}"})
+    ET.SubElement(bsdf, "float", attrib={"name": "scattering_coefficient", "value": f"{float(mat.scattering_coefficient):.6g}"})
+    ET.SubElement(bsdf, "float", attrib={"name": "xpd_coefficient", "value": f"{float(mat.xpd_coefficient):.6g}"})
+
+
+def _add_obj_shape(scene_el: ET.Element, obj_relpath: str, bsdf_id: str, shape_id: Optional[str] = None) -> None:
+    attrib = {"type": "obj"}
+    if shape_id is not None:
+        attrib["id"] = shape_id
+    shape = ET.SubElement(scene_el, "shape", attrib=attrib)
+    ET.SubElement(shape, "string", attrib={"name": "filename", "value": obj_relpath})
+    ET.SubElement(shape, "ref", attrib={"id": bsdf_id})
+
+
+def export_scene_xml_from_parts(
+    *,
     out_dir: Path,
     xml_name: str = "scene.xml",
-    mesh_name: str = "scene.obj",
-    bsdf_id: str = "mat-itu_concrete",
-):
+    meshes_subdir: str = "meshes",
+    parts: Dict[str, trimesh.Trimesh],
+    materials: Dict[str, ItuRadioMaterialSpec],
+) -> Path:
     """
-    Export a single-mesh scene:
-      out_dir/scene.xml
-      out_dir/meshes/scene.obj
+    Export a Sionna-loadable Mitsuba XML scene from explicit mesh parts.
+
+    Args:
+      out_dir: output directory
+      xml_name: name of the xml file
+      meshes_subdir: where to put OBJs relative to out_dir
+      parts: dict like {"walls": mesh, "floor": mesh, "ceiling": mesh}
+      materials: dict like {"walls": ItuRadioMaterialSpec(...), ...} (keys must match parts)
+
+    Returns:
+      Path to written XML file.
     """
     out_dir = Path(out_dir)
-    meshes_dir = out_dir / "meshes"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meshes_dir = out_dir / meshes_subdir
     meshes_dir.mkdir(parents=True, exist_ok=True)
 
-    m = _triangulate_if_quads(mesh)
-    m.export(meshes_dir / mesh_name)
+    # --- Build XML ---
+    scene_el = ET.Element("scene", attrib={"version": "3.0.0"})
 
-    _write_minimal_mitsuba_xml(
-        out_dir / xml_name,
-        shape_entries=[("mesh-scene", f"meshes/{mesh_name}", bsdf_id)],
-    )
+    # Integrator is not important for RT, but Mitsuba XML likes having one.
+    integrator = ET.SubElement(scene_el, "integrator", attrib={"type": "path"})
+    ET.SubElement(integrator, "integer", attrib={"name": "max_depth", "value": "12"})
+
+    # --- Materials ---
+    # De-duplicate by bsdf_id (multiple parts can share a material)
+    seen = set()
+    for key, mat in materials.items():
+        if mat.bsdf_id in seen:
+            continue
+        _add_itu_bsdf(scene_el, mat)
+        seen.add(mat.bsdf_id)
+
+    # --- Shapes (write OBJs and reference them) ---
+    for part_name, mesh in parts.items():
+        if part_name not in materials:
+            raise KeyError(f"Missing material for part '{part_name}'. Have materials={list(materials.keys())}")
+
+        obj_name = f"{part_name}.obj"
+        obj_path = meshes_dir / obj_name
+        _safe_export_obj(mesh, obj_path)
+
+        obj_rel = f"{meshes_subdir}/{obj_name}"
+        _add_obj_shape(scene_el, obj_rel, materials[part_name].bsdf_id, shape_id=part_name)
+
+    _indent_xml(scene_el)
+    xml_path = out_dir / xml_name
+    ET.ElementTree(scene_el).write(xml_path, encoding="utf-8", xml_declaration=True)
+    return xml_path
 
 
 def export_walls_floor_ceiling_xml(
     mesh: trimesh.Trimesh,
+    *,
     out_dir: Path,
     xml_name: str = "scene.xml",
-    wall_bsdf: str = "mat-itu_brick",
-    floor_bsdf: str = "mat-itu_concrete",
-    ceil_bsdf: str = "mat-itu_concrete",
-):
+    meshes_subdir: str = "meshes",
+    wall_material: ItuRadioMaterialSpec,
+    floor_material: Optional[ItuRadioMaterialSpec] = None,
+    ceiling_material: Optional[ItuRadioMaterialSpec] = None,
+    atol: float = 1e-6,
+) -> Path:
     """
-    Export a walls_to_mesh()-style mesh into 3 OBJ files + XML:
-      meshes/walls.obj, meshes/floor.obj, meshes/ceiling.obj
+    Convenience wrapper: given ONE mesh (e.g., from walls_to_mesh),
+    split it into walls/floor/ceiling by z-planes and export an XML scene.
+
+    If floor_material/ceiling_material are None, they reuse wall_material.
     """
-    out_dir = Path(out_dir)
-    meshes_dir = out_dir / "meshes"
-    meshes_dir.mkdir(parents=True, exist_ok=True)
+    walls_m, floor_m, ceil_m = split_walls_floor_ceiling(mesh, atol=atol)
 
-    floor, ceil, walls = split_floor_ceiling_walls(mesh)
-
-    shape_entries = []
-    if ceil is not None:
-        ceil.export(meshes_dir / "ceiling.obj")
-        shape_entries.append(("mesh-ceiling", "meshes/ceiling.obj", ceil_bsdf))
-    if floor is not None:
-        floor.export(meshes_dir / "floor.obj")
-        shape_entries.append(("mesh-floor", "meshes/floor.obj", floor_bsdf))
-    if walls is not None:
-        walls.export(meshes_dir / "walls.obj")
-        shape_entries.append(("mesh-walls", "meshes/walls.obj", wall_bsdf))
-
-    _write_minimal_mitsuba_xml(out_dir / xml_name, shape_entries)
+    parts = {"walls": walls_m, "floor": floor_m, "ceiling": ceil_m}
+    mats = {
+        "walls": wall_material,
+        "floor": floor_material or wall_material,
+        "ceiling": ceiling_material or wall_material,
+    }
+    return export_scene_xml_from_parts(
+        out_dir=out_dir,
+        xml_name=xml_name,
+        meshes_subdir=meshes_subdir,
+        parts=parts,
+        materials=mats,
+    )
 
 
 # ----------------------------
-# Import: xml -> Scene/mesh
+# Optional: round-trip helpers
 # ----------------------------
 
-def load_ns3sionna_xml_as_mlink_scene(xml_path: Path, frequency_hz: float) -> Scene:
+def load_xml_as_sionna_scene(xml_path: Path, *, frequency_hz: Optional[float] = None):
     """
-    Best import path for your pipeline:
-    - Uses sionna.rt.load_scene(xml)
-    - Keeps the loaded sionna scene attached to Scene.sionna_scene
-      so cost.py can traverse bsdf radio parameters without losing them.
+    Load XML via sionna.rt.load_scene (requires sionna[rt] installed).
     """
-    from sionna.rt import load_scene  # local import
-
-    xml_path = Path(xml_path)
-    si = load_scene(str(xml_path))
-    si.frequency = float(frequency_hz)
-
-    sc = Scene.from_sionna(si)
-    sc.sionna_scene = si  # IMPORTANT: preserve original radio materials/bssdf params
+    import sionna.rt as rt  # noqa: F401
+    sc = rt.load_scene(str(xml_path))
+    if frequency_hz is not None:
+        sc.frequency = float(frequency_hz)
     return sc
 
 
-def load_ns3sionna_xml_meshes(xml_path: Path) -> list[tuple[trimesh.Trimesh, str]]:
+def load_xml_as_mlink_scene(xml_path: Path, *, frequency_hz: float):
     """
-    Lightweight import (no Sionna):
-    - Parses the XML
-    - Loads referenced OBJ files
-    - Returns [(mesh, bsdf_id), ...]
+    Load XML into Sionna scene, then convert to your internal mlink.scene.Scene.
+
+    Requires mlink.scene.Scene.from_sionna to exist in your repo.
     """
-    xml_path = Path(xml_path)
-    base = xml_path.parent
-
-    tree = ET.parse(str(xml_path))
-    root = tree.getroot()
-
-    out = []
-    for shape in root.findall(".//shape"):
-        if shape.get("type") != "obj":
-            continue
-        fn = shape.find("./string[@name='filename']")
-        if fn is None:
-            continue
-        rel = fn.get("value")
-        if rel is None:
-            continue
-
-        ref = shape.find("./ref[@name='bsdf']")
-        bsdf_id = ref.get("id") if ref is not None else "unknown"
-
-        mesh_path = (base / rel).resolve()
-        mesh = trimesh.load_mesh(mesh_path, process=False)
-        out.append((mesh, bsdf_id))
-
-    return out
+    sc = load_xml_as_sionna_scene(xml_path, frequency_hz=frequency_hz)
+    from mlink.scene import Scene  # imported late to avoid hard dependency
+    return Scene.from_sionna(sc)
