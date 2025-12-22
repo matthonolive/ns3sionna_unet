@@ -51,6 +51,156 @@ def rc_to_xy_m(rc: np.ndarray, cell_size_m: float) -> np.ndarray:
 def clamp(z: float, lo: float, hi: float) -> float:
     return float(min(max(z, lo), hi))
 
+def count_wall_cells_on_segment(
+    walls_2d: np.ndarray,
+    a_rc: np.ndarray,
+    b_rc: np.ndarray,
+    oversample: int = 6,
+) -> int:
+    """
+    Approximate how many wall cells (value==1) a straight line from a_rc to b_rc passes through.
+    Uses oversampled line sampling + unique visited cells.
+    """
+    H, W = walls_2d.shape
+    a_r, a_c = int(a_rc[0]), int(a_rc[1])
+    b_r, b_c = int(b_rc[0]), int(b_rc[1])
+
+    dr = b_r - a_r
+    dc = b_c - a_c
+    n = int(max(abs(dr), abs(dc)) * oversample) + 1
+    if n <= 2:
+        return 0
+
+    rr = np.linspace(a_r, b_r, n)
+    cc = np.linspace(a_c, b_c, n)
+    r = np.clip(np.rint(rr).astype(np.int32), 0, H - 1)
+    c = np.clip(np.rint(cc).astype(np.int32), 0, W - 1)
+
+    # ignore endpoints
+    r = r[1:-1]
+    c = c[1:-1]
+    if r.size == 0:
+        return 0
+
+    # unique visited cells
+    idx = np.unique(r * W + c)
+    r_u = idx // W
+    c_u = idx % W
+    return int(walls_2d[r_u, c_u].sum())
+
+def rc_dist_m(a_rc: np.ndarray, b_rc: np.ndarray, cell_size_m: float) -> float:
+    dr = float(a_rc[0] - b_rc[0])
+    dc = float(a_rc[1] - b_rc[1])
+    return (dr * dr + dc * dc) ** 0.5 * cell_size_m
+
+def select_friis_adversarial_placements(
+    walls_2d: np.ndarray,
+    rng: np.random.Generator,
+    n_sta: int,
+    cell_size_m: float,
+    *,
+    d_min_m: float,
+    d_max_m: float,
+    dist_tol_frac: float,
+    min_wall_cells: int,
+    max_ap_tries: int = 200,
+    max_sta_tries: int = 20000,
+    oversample: int = 6,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Returns:
+      tx_rc: (2,)
+      sta_rc: (n_sta, 2)
+      meta: dict with wall_hits/dist_m/is_los per STA, and the chosen control distance.
+    Strategy:
+      - pick AP in free cell
+      - pick 1 LoS control STA at distance in [d_min_m, d_max_m]
+      - pick remaining STAs blocked with wall_hits>=min_wall_cells and distance within dist_tol_frac of control
+    """
+    free = np.argwhere(walls_2d == 0)
+    if free.shape[0] < (1 + n_sta):
+        raise RuntimeError("Not enough free cells for requested nodes")
+
+    def wall_hits(a, b) -> int:
+        return count_wall_cells_on_segment(walls_2d, a, b, oversample=oversample)
+
+    for _ in range(max_ap_tries):
+        tx_rc = free[rng.integers(0, free.shape[0])]
+
+        # 1) pick LoS control STA
+        control_rc = None
+        control_d = None
+        control_hits = None
+
+        for _j in range(max_sta_tries // 10):
+            cand = free[rng.integers(0, free.shape[0])]
+            if (cand == tx_rc).all():
+                continue
+            d = rc_dist_m(tx_rc, cand, cell_size_m)
+            if not (d_min_m <= d <= d_max_m):
+                continue
+            hits = wall_hits(tx_rc, cand)
+            if hits == 0:
+                control_rc = cand
+                control_d = d
+                control_hits = hits
+                break
+
+        if control_rc is None:
+            continue
+
+        # 2) pick blocked STAs with similar distance
+        sta_rc_list = [control_rc]
+        sta_meta = [{
+            "is_los": True,
+            "wall_cells": int(control_hits),
+            "dist_m": float(control_d),
+        }]
+
+        # distance matching window
+        d0 = float(control_d)
+        d_lo = d0 * (1.0 - dist_tol_frac)
+        d_hi = d0 * (1.0 + dist_tol_frac)
+
+        tries = 0
+        while len(sta_rc_list) < n_sta and tries < max_sta_tries:
+            tries += 1
+            cand = free[rng.integers(0, free.shape[0])]
+            if (cand == tx_rc).all():
+                continue
+            if any((cand == x).all() for x in sta_rc_list):
+                continue
+
+            d = rc_dist_m(tx_rc, cand, cell_size_m)
+            if not (d_lo <= d <= d_hi):
+                continue
+
+            hits = wall_hits(tx_rc, cand)
+            if hits >= min_wall_cells:
+                sta_rc_list.append(cand)
+                sta_meta.append({
+                    "is_los": False,
+                    "wall_cells": int(hits),
+                    "dist_m": float(d),
+                })
+
+        if len(sta_rc_list) < n_sta:
+            # couldn't fill blocked STAs for this AP; try another AP
+            continue
+
+        sta_rc = np.stack(sta_rc_list, axis=0)
+        meta = {
+            "control_dist_m": float(d0),
+            "d_window_m": [float(d_lo), float(d_hi)],
+            "min_wall_cells": int(min_wall_cells),
+            "sta": sta_meta,
+        }
+        return tx_rc, sta_rc, meta
+
+    raise RuntimeError(
+        "Failed to find Friis-adversarial placements. "
+        "Try lowering min_wall_cells, increasing dist_tol_frac, or increasing max_partitions."
+    )
 
 def main():
     ap = argparse.ArgumentParser()
@@ -88,6 +238,18 @@ def main():
     ap.add_argument("--wall_thickness_m", type=float, default=0.10)
     ap.add_argument("--floor_thickness_m", type=float, default=0.15)
     ap.add_argument("--ceiling_thickness_m", type=float, default=0.10)
+
+    #Adversarial Friis placements
+    ap.add_argument("--friis_adversarial", action="store_true",
+                    help="Choose placements to make Friis fail (LoS control + blocked STAs at same distance)")
+    ap.add_argument("--d_min_m", type=float, default=8.0)
+    ap.add_argument("--d_max_m", type=float, default=30.0)
+    ap.add_argument("--dist_tol_frac", type=float, default=0.10,
+                    help="Blocked STA distance must be within +/- this fraction of control distance")
+    ap.add_argument("--min_wall_cells", type=int, default=2,
+                    help="Require >= this many wall grid cells intersected by the TX->STA line for blocked STAs")
+
+
 
     ap.add_argument("--double_sided", action="store_false", help="Duplicate faces to make surfaces bidirectional")
     args = ap.parse_args()
@@ -185,10 +347,25 @@ def main():
         )
 
         # Placements: sample one AP + N STAs in free cells
-        rc = sample_free_cells(walls_2d, rng, n=(1 + args.n_sta))
-        xy = rc_to_xy_m(rc, float(args.cell_size_m))
-        tx_xy = xy[0]
-        sta_xy = xy[1:]
+        if args.friis_adversarial:
+            tx_rc, sta_rc, place_meta = select_friis_adversarial_placements(
+                walls_2d,
+                rng,
+                n_sta=args.n_sta,
+                cell_size_m=float(args.cell_size_m),
+                d_min_m=float(args.d_min_m),
+                d_max_m=float(args.d_max_m),
+                dist_tol_frac=float(args.dist_tol_frac),
+                min_wall_cells=int(args.min_wall_cells),
+            )
+            tx_xy = rc_to_xy_m(tx_rc[None, :], float(args.cell_size_m))[0]
+            sta_xy = rc_to_xy_m(sta_rc, float(args.cell_size_m))
+        else:
+            rc = sample_free_cells(walls_2d, rng, n=(1 + args.n_sta))
+            xy = rc_to_xy_m(rc, float(args.cell_size_m))
+            tx_xy = xy[0]
+            sta_xy = xy[1:]
+            place_meta = None
 
         # Clamp heights inside floor/ceiling (meters)
         floor_h_m = floor_h_units * float(args.cell_size_m)
@@ -208,6 +385,10 @@ def main():
             "tx_xyz": [float(tx_xy[0]), float(tx_xy[1]), float(tx_z)],
             "sta_xyz": [[float(x), float(y), float(rx_z)] for x, y in sta_xy],
         }
+
+        if place_meta is not None:
+            placements["friis_adversarial_meta"] = place_meta
+
         (scene_dir / "placements.json").write_text(json.dumps(placements, indent=2))
 
         scene_info = {
