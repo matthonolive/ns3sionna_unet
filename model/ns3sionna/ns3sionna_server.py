@@ -245,6 +245,9 @@ class SionnaEnv:
 
         # compute look-ahead
         look_ahead = math.floor(self.sub_mode / (len(nodes_to_update) - 1))
+        if look_ahead <= 0:
+            # behave like classic P2MP at the requested time
+            return self.compute_cfr_classic(csi_req, reply_wrapper, SionnaEnv.MODE_P2MP)
 
         print(f'compute CFR to #RX={len(nodes_to_update) - 1} with LAH={look_ahead}')
 
