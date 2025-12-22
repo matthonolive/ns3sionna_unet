@@ -18,6 +18,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cmath>
 
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
@@ -41,12 +42,41 @@
 #include "ns3/spectrum-wifi-helper.h"
 #include "ns3/spectrum-module.h"
 
+//Yans Wifi 
+#include "ns3/yans-wifi-helpers.h"
+
+
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("ExampleSionnaUnetCompare");
 
 // hardcoded like upstream examples
 static const std::string kZmqEndpoint = "tcp://localhost:5555";
+
+
+static int
+GetSubcarrierSpacingHz (WifiStandard std)
+{
+  switch (std)
+    {
+    case WIFI_STANDARD_80211ax:
+      return 78125;   // 78.125 kHz
+    default:
+      return 312500;  // 312.5 kHz for 11a/g/n/ac
+    }
+}
+
+static int
+GetFftSize (WifiStandard std, int bwMhz)
+{
+  // 11ax uses 256 bins @ 20 MHz, scales linearly with BW
+  if (std == WIFI_STANDARD_80211ax)
+    {
+      return (int) std::lround (bwMhz * 12.8); // 20->256, 40->512, 80->1024, 160->2048
+    }
+  // legacy 64 bins @ 20 MHz, scales linearly
+  return (bwMhz / 20) * 64; // 20->64, 40->128, 80->256, 160->512
+}
 
 static double
 GetCenterFreqMhz (Ptr<NetDevice> dev)
@@ -323,7 +353,7 @@ main (int argc, char* argv[])
           NS_ABORT_MSG ("Unknown propModel: " << propModel << " (use sionna|friis)");
         }
 
-      YansWifiPhyHelper phy = YansWifiPhyHelper::Default ();
+      YansWifiPhyHelper phy;
       phy.SetChannel (yansChannel);
       phy.Set ("TxPowerStart", DoubleValue (txPowerDbm));
       phy.Set ("TxPowerEnd", DoubleValue (txPowerDbm));
@@ -437,8 +467,15 @@ main (int argc, char* argv[])
 
       if (!useSpectrum)
         {
-          // wideband: center freq + bandwidth
-          sionnaHelper->Configure (fcMhz, bwMhz);
+            // wideband: center freq + bandwidth
+            const int fcMhz = (int) std::lround (GetCenterFreqMhz (apDevs.Get (0)));
+            const int bwMhz = (int) std::lround (GetChannelWidthMhz (apDevs.Get (0)));
+            const int fftSize = GetFftSize (wifiStandard, bwMhz);
+            const int scsHz = GetSubcarrierSpacingHz (wifiStandard);
+            int minCoherenceMs = 10;
+
+            // 4-arg signature in your tree
+            sionnaHelper->Configure (fcMhz, bwMhz, fftSize, scsHz, minCoherenceMs);
         }
       else
         {
