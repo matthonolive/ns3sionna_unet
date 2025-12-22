@@ -76,3 +76,8 @@ build_lib_example(
         LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libbuildings} ${libinternet} ${libapplications}
 )
 
+build_lib_example(
+        NAME ns3sionna-example-sionna-unet-compare
+        SOURCE_FILES example-sionna-unet-compare.cc
+        LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libbuildings} ${libinternet} ${libapplications}
+)
