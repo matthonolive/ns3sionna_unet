@@ -817,7 +817,7 @@ if __name__ == '__main__':
     parser.add_argument("--default_mode", type=int, default=SionnaEnv.MODE_P2MP, help="Which mode to use if not set by ns3")
     parser.add_argument("--rt_fast", help="Use simplified raytracing for faster computations", action='store_true')
     parser.add_argument("--rt_max_parallel_links", type=int, default=256, help="Max no. of link simulated at once; depends on GPU memory")
-    parser.add_argument("--est_csi", help="Whether to estimate complex CSI per OFDM subcarrier", type=bool, default=True)
+    parser.add_argument("--est_csi", help="Whether to estimate complex CSI per OFDM subcarrier", type=bool, default=False)
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
     args = parser.parse_args()
 
