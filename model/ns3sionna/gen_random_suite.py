@@ -406,6 +406,13 @@ def main():
 
         print(f"[ok] {scene_dir.name}: wrote scene.xml + meshes + placements.json")
 
+        csv_lines = []
+        tx = placements["tx_xyz"]
+        csv_lines.append(f"tx,{tx[0]},{tx[1]},{tx[2]}")
+        for s in placements["sta_xyz"]:
+            csv_lines.append(f"sta,{s[0]},{s[1]},{s[2]}")
+        (scene_dir / "placements.csv").write_text("\n".join(csv_lines) + "\n")
+
     print(f"\n[done] suite written to: {out_root}")
 
 

@@ -88,7 +88,7 @@ class SionnaEnv:
         self.gpus = tf.config.list_physical_devices("GPU")
 
         if len(self.gpus) > 0:
-            print("GPU support detected; no GPUs:", self.gpus)
+            print("GPU support detected:", self.gpus)
         else:
             print("Using CPU backend")
 

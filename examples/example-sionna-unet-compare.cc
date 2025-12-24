@@ -43,7 +43,7 @@
 #include "ns3/spectrum-module.h"
 
 //Yans Wifi 
-#include "ns3/yans-wifi-helpers.h"
+#include "ns3/yans-wifi-helper.h"
 
 
 using namespace ns3;
@@ -151,6 +151,56 @@ PrintResults (Ptr<FlowMonitor> monitor, FlowMonitorHelper& flowmon, double simTi
   std::cout << "mean jitter ms  = " << meanJitterMs << "\n";
 }
 
+
+
+static bool
+LoadPlacementsCsv(const std::string& path, ns3::Vector& tx, std::vector<ns3::Vector>& stas)
+{
+    std::ifstream f(path);
+    if (!f.is_open())
+    {
+        std::cerr << "[ERR] could not open placementsCsv: " << path << "\n";
+        return false;
+    }
+
+    std::string line;
+    bool haveTx = false;
+    while (std::getline(f, line))
+    {
+        if (line.empty() || line[0] == '#')
+            continue;
+
+        std::stringstream ss(line);
+        std::string tag, xs, ys, zs;
+
+        if (!std::getline(ss, tag, ',')) continue;
+        if (!std::getline(ss, xs, ',')) continue;
+        if (!std::getline(ss, ys, ',')) continue;
+        if (!std::getline(ss, zs, ',')) continue;
+
+        double x = std::stod(xs);
+        double y = std::stod(ys);
+        double z = std::stod(zs);
+
+        if (tag == "tx" || tag == "ap")
+        {
+            tx = ns3::Vector(x, y, z);
+            haveTx = true;
+        }
+        else if (tag == "sta" || tag == "rx")
+        {
+            stas.emplace_back(x, y, z);
+        }
+    }
+
+    if (!haveTx || stas.empty())
+    {
+        std::cerr << "[ERR] placementsCsv missing tx or sta lines: " << path << "\n";
+        return false;
+    }
+    return true;
+}
+
 int
 main (int argc, char* argv[])
 {
@@ -217,6 +267,14 @@ main (int argc, char* argv[])
   cmd.AddValue("rwSpeedMax", "RandomWalk2d max speed (m/s)", rwSpeedMax);
   cmd.AddValue("rwPause", "RandomWalk2d pause (s)", rwPauseS);
 
+  std::string placementsCsv = "";
+  cmd.AddValue("placementsCsv", "CSV file with tx/sta placements (tx,x,y,z and sta,x,y,z). If set, overrides apX/apY and STA random placement.", placementsCsv);
+
+  int staStartIndex = 0;
+  cmd.AddValue("staStartIndex", "Start index into placementsCsv STA list", staStartIndex);
+
+
+
   cmd.Parse(argc, argv);
 
   RngSeedManager::SetSeed ((uint32_t) seed);
@@ -234,6 +292,39 @@ main (int argc, char* argv[])
   NodeContainer staNodes;
   staNodes.Create (nSta);
 
+
+  // If placementsCsv is set, load positions from there
+  bool usePlacements = !placementsCsv.empty();
+  ns3::Vector txPos;
+  std::vector<ns3::Vector> staPos;
+
+  if (usePlacements)
+  {
+      if (!LoadPlacementsCsv(placementsCsv, txPos, staPos))
+          return 1;
+
+      // Override AP values from file
+      apX = txPos.x;
+      apY = txPos.y;
+      apZ = txPos.z;
+
+      // If user asked for nSta, take the first nSta entries
+      if (staStartIndex < 0 || (int)staPos.size() < (int)(staStartIndex + nSta))
+      {
+          std::cerr << "[ERR] placementsCsv has only " << staPos.size()
+                    << " STAs but need indices [" << staStartIndex
+                    << ".." << (staStartIndex + nSta - 1) << "]\n";
+          return 1;
+      }
+  }
+
+  Ptr<ListPositionAllocator> staAlloc = CreateObject<ListPositionAllocator>();
+  if (usePlacements)
+  {
+      for (int i = 0; i < (int)nSta; ++i)
+        staAlloc->Add(staPos[staStartIndex + i]);
+  }
+
   // --- Mobility ---
   // AP: fixed
   {
@@ -249,9 +340,17 @@ main (int argc, char* argv[])
 
     if (mobilityMode == "static")
       {
+        if (usePlacements)
+        {
+            mobSta.SetPositionAllocator(staAlloc);
+        }
+        else
+        {
         mobSta.SetPositionAllocator("ns3::RandomRectanglePositionAllocator",
                                    "X", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" + std::to_string(areaX) + "]"),
                                    "Y", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" + std::to_string(areaY) + "]"));
+        }
+
         mobSta.SetMobilityModel ("ns3::SionnaMobilityModel");
         mobSta.Install (staNodes);
 
@@ -263,9 +362,17 @@ main (int argc, char* argv[])
       }
     else if (mobilityMode == "randomwalk2d")
       {
+
+        if (usePlacements)
+        {
+            mobSta.SetPositionAllocator(staAlloc);
+        }
+        else
+        {
         mobSta.SetPositionAllocator("ns3::RandomRectanglePositionAllocator",
                                    "X", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" + std::to_string(areaX) + "]"),
                                    "Y", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" + std::to_string(areaY) + "]"));
+        }
 
         std::ostringstream bounds;
         bounds << "ns3::Rectangle[MinX=0.0|MinY=0.0|MaxX=" << areaX << "|MaxY=" << areaY << "]";
@@ -283,7 +390,8 @@ main (int argc, char* argv[])
         for (uint32_t i = 0; i < nSta; ++i)
           {
             Vector p = staNodes.Get(i)->GetObject<MobilityModel>()->GetPosition();
-            staNodes.Get(i)->GetObject<MobilityModel>()->SetPosition(Vector(p.x, p.y, staZ));
+            double z = usePlacements ? p.z : staZ;
+            staNodes.Get(i)->GetObject<MobilityModel>()->SetPosition(Vector(p.x, p.y, z));
           }
       }
     else
@@ -291,6 +399,11 @@ main (int argc, char* argv[])
         NS_ABORT_MSG ("Unknown mobility mode: " << mobilityMode << " (use static|randomwalk2d)");
       }
   }
+
+  auto ap = apNode.Get(0)->GetObject<MobilityModel>()->GetPosition();
+  auto sta = staNodes.Get(0)->GetObject<MobilityModel>()->GetPosition();
+  std::cout << "AP=("<<ap.x<<","<<ap.y<<","<<ap.z<<") "
+            << "STA0=("<<sta.x<<","<<sta.y<<","<<sta.z<<")\n";
 
   // --- Wi-Fi common ---
   WifiHelper wifi;
