@@ -27,6 +27,7 @@ class Scene:
     face2material: dict[int, int]
     antenna_database: AntennaDatabase
     sionna_scene: sionna.rt.Scene | None = None
+    sionna_scene_geometry: sionna.rt.Scene | None = None
 
     def to_sionna(self, frequency: float):
         if self.sionna_scene is not None and self.sionna_scene.frequency == frequency:
@@ -187,6 +188,57 @@ class Scene:
             antenna_database=antenna_database,
             face2material=face_to_material,
         )
+    
+    
+    def to_sionna_geometry(self, frequency: float):
+        """
+        Build geometry + radio materials ONLY.
+        Does NOT add transmitters/receivers.
+        """
+        if self.sionna_scene_geometry is not None and self.sionna_scene_geometry.frequency == frequency:
+            return self.sionna_scene_geometry
+
+        material2face = defaultdict(list)
+        for face_id, material_id in self.face2material.items():
+            material2face[material_id].append(face_id)
+
+        meshes = []
+        for material_id, face_list in material2face.items():
+            material_data = (
+                self.material_database
+                .filter((pl.col("id") == material_id) & (pl.col("frequency") == frequency))
+                .head(1)
+            )
+            if material_data.height == 0:
+                raise ValueError(f"No material row for id={material_id}, frequency={frequency}")
+
+            sionna_material = sionna.rt.RadioMaterial(
+                name=material_data[0, "name"],
+                thickness=material_data[0, "thickness"],
+                relative_permittivity=material_data[0, "permittivity"],
+                conductivity=material_data[0, "conductivity"],
+            )
+
+            single_material_meshes = self.mesh.submesh([face_list], append=False)
+            assert isinstance(single_material_meshes, list)
+            meshes.extend([trimesh2mitsuba(m, sionna_material) for m in single_material_meshes])
+
+        assert len(meshes) > 0
+
+        mi_scene = mi.load_dict(
+            {"type": "scene", "integrator": {"type": "path"}}
+            | {f"mesh_{i}": mesh for i, mesh in enumerate(meshes)}
+        )
+        assert isinstance(mi_scene, mi.Scene)
+
+        si_scene = sionna.rt.Scene(mi_scene)
+        si_scene.tx_array = sionna.rt.PlanarArray(num_rows=1, num_cols=1, pattern="iso", polarization="V")
+        si_scene.rx_array = si_scene.tx_array
+        si_scene.frequency = frequency
+
+        self.sionna_scene_geometry = si_scene
+        return si_scene
+
 
 
 

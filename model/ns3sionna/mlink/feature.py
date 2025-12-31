@@ -106,14 +106,12 @@ def binary_walls(scene: Scene, frequency: float) -> npt.NDArray[np.floating]:
         walls[wall_idxs[:, 0], wall_idxs[:, 1]] = 1
         wall_tensor_lst.append(walls)
 
-    wall_maps = np.stack(wall_tensor_lst)[np.newaxis, :, np.newaxis, ...]
+    wall_tensor = np.stack(wall_tensor_lst, axis=0).astype(np.float32)  # (K,H,W)
 
-    # stack wall-maps based off number of transmitters
-    wall_maps = np.repeat(
-        wall_maps,
-        repeats=scene.antenna_database.tx_coords.shape[0],
-        axis=0,
-    )
+    # shape to (1,1,K,H,W) then repeat over tx -> (tx,1,K,H,W)
+    wall_maps = wall_tensor[None, None, :, :, :]
+    wall_maps = np.repeat(wall_maps, repeats=scene.antenna_database.tx_coords.shape[0], axis=0)
+    
     return wall_maps
 
 
@@ -139,9 +137,7 @@ def ray_features(
     )
 
     total_wall_loss = total_wall_loss.reshape(-1, 1, *rx_grid.shape)
-
-    ed = np.maximum(electrical_distance, 1e-9)
-    free_space_loss = 20 * np.log10(4 * np.pi * ed)
+    free_space_loss = 20 * np.log10(4 * np.pi * electrical_distance)
     total_path_loss = -free_space_loss + 10 * np.log10(total_wall_loss)
 
     num_obstructions = num_obstructions.reshape(-1, 1, *rx_grid.shape)
