@@ -501,10 +501,10 @@ class SionnaEnv:
 
         # Configure antenna array for all transmitters/receivers
         self.scene.tx_array = PlanarArray(num_rows=1, num_cols=1, vertical_spacing=0.5, horizontal_spacing=0.5,
-                                     pattern="tr38901", polarization="V")
+                                     pattern="iso", polarization="V")
 
         self.scene.rx_array = PlanarArray(num_rows=1, num_cols=1, vertical_spacing=0.5, horizontal_spacing=0.5,
-                                     pattern="dipole", polarization="V")
+                                     pattern="iso", polarization="V")
 
         # set current sim time to 0ns
         self.sim_time = 0
@@ -910,6 +910,11 @@ class SionnaEnv:
         :return: (list(rx_node), list(link propagation delay), list(wideband loss), list(normalized CFR))
         '''
 
+        def fspl_db(d_m: float, fc_hz: float) -> float:
+            d_m = max(float(d_m), 1e-6)
+            lam = 299792458.0 / float(fc_hz)
+            return 20.0 * np.log10(4.0 * np.pi * d_m / lam)
+
         # execute mobility
         dt = req_sim_time - self.sim_time
 
@@ -929,6 +934,39 @@ class SionnaEnv:
         # place TX and RX
         rx_nodes = nodes_to_update
         rx_nodes.remove(tx_node)
+
+        ###Helper for checking stats on reciprocity###
+
+        def _tau_rms_ns_from_cir(a_link, tau_link):
+            '''
+            Docstring for _tau_rms_ns_from_cir
+            
+            :param a_link: arrays for one link
+            :param tau_link: tau in seconds
+
+            returns tau_rms in ns
+            '''
+
+            a_link = np.asarray(a_link)
+            tau_link = np.asarray(tau_link)
+
+            a_flat = np.squeeze(a_link).reshape(-1)
+            tau_flat = np.squeeze(tau_link).reshape(-1)
+
+            m = np.isfinite(tau_flat) & (tau_flat > 0) & np.isfinite(a_flat)
+            if not np.any(m):
+                return 0.0
+            
+            p = np.abs(a_flat[m])**2 
+            ps = float(np.sum(p))
+            if ps <= 0.0:
+                return 0.0
+            w = p / ps
+            t = tau_flat[m]
+            mu = float(np.sum(w*t))
+            mu2 = float(np.sum(w*t**2))
+            var = max(0.0, mu2 - mu**2 )
+            return math.sqrt(var) * 1e9  # in ns
 
         if self.use_unet:
             tx_pos = np.array(self.node_info[tx_node].pos, dtype=np.float32)
@@ -952,6 +990,11 @@ class SionnaEnv:
 
                 # delay: d/c + excess
                 d_m = float(np.linalg.norm(tx_pos - rx_pos))
+
+                ##Friis for comparison###
+                friis_loss_db = fspl_db(d_m, self.fc)
+                print(f"[FRIIS] tx={tx_node} rx={curr_rx_node} d={d_m:.3f} m fspl={friis_loss_db:.2f} dB")
+
                 base_ns = d_m / 299792458.0 * 1e9
                 ex = 0.0 if excess_ns is None else float(max(0.0, excess_ns))
                 lnk_delay_arr.append(int(round(base_ns + ex)))
@@ -1025,10 +1068,33 @@ class SionnaEnv:
             lnk_tau = np.squeeze(tau[rx_id, :, :, :, :])
             lnk_delay = int(round(np.min(lnk_tau[lnk_tau >= 0] * 1e9), 0))
 
+            ### Reciprocity stats ###
+
+            tx_pos = np.array(self.node_info[tx_node].pos, dtype=np.float64)
+            rx_pos = np.array(self.node_info[curr_rx_node].pos, dtype=np.float64)
+            d_m = float(np.linalg.norm(tx_pos - rx_pos))
+
+            ##Friis for comparison###
+            friis_loss_db = fspl_db(d_m, self.fc)
+            print(f"[FRIIS] tx={tx_node} rx={curr_rx_node} d={d_m:.3f} m fspl={friis_loss_db:.2f} dB")
+
+            base_ns = d_m / 299792458.0 * 1e9
+            ex_ns = float(max(0.0, lnk_delay - base_ns))
+            a_link = np.squeeze(a[rx_id, :, :, :, :, :])
+            tau_link = np.squeeze(tau[rx_id, :, :, :, :])
+            tau_rms_ns = _tau_rms_ns_from_cir(a_link, tau_link)
+            
+
             h = np.squeeze(h_raw[rx_id, :, :, :, :, ])
 
             # see Parseval's theorem
             lnk_loss = float(-10 * np.log10(np.mean(np.abs(h) ** 2)))
+
+            print(
+                f"[RT] tx={tx_node} rx={curr_rx_node} "
+                f"d={d_m:.3f}m delay={lnk_delay}ns (base={base_ns:.3f}+ex={ex_ns:.3f}) "
+                f"wb={lnk_loss:.3f}dB tau_rms={tau_rms_ns:.4f}ns"
+            )
 
             # for frequency-selective channel
             power = np.mean(np.abs(h) ** 2)  # shape [batch_size, 1, 1, 1]
