@@ -15,6 +15,15 @@ from collections import deque
 import warnings
 
 import tensorflow as tf
+
+try:
+    gpus = tf.config.list_physical_devices("GPU")
+    for g in gpus:
+        tf.config.experimental.set_memory_growth(g, True)
+except Exception:
+    pass
+
+
 import mitsuba as mi
 import math
 from millify import millify
@@ -113,6 +122,12 @@ class UNetTdlPropagator:
         self.y_mean = torch.from_numpy(y_mean).float().to(self.device)
         self.y_std  = torch.from_numpy(y_std).float().to(self.device).clamp_min(1e-6)
 
+        self.keep_idx = None
+        if "keep_idx" in stats.files:
+            ki = stats["keep_idx"]
+            if ki is not None and np.size(ki) > 0:
+                self.keep_idx = np.asarray(ki, dtype=np.int64)
+
         # set later
         self._base_scene = None
         self._rx_grid = None
@@ -123,18 +138,25 @@ class UNetTdlPropagator:
         self._cached_tx_key = None
         self._cached_maps = None  # (K,y_ch,H,W) float32
 
-    def attach_scene(self, sionna_scene, bbox, fc_hz: float, fft_size: int, subcarrier_spacing_hz: float):
+    def attach_scene(self, sionna_scene, bbox, fc_hz: float, fft_size: int, subcarrier_spacing_hz: float, frequencies_hz: np.ndarray):
         self.fc_hz = float(fc_hz)
         self.fft_size = int(fft_size)
         self.subcarrier_spacing_hz = float(subcarrier_spacing_hz)
+        self.frequencies = np.asarray(frequencies_hz, dtype=np.float64)
 
         self._base_scene = MlinkScene.from_sionna(sionna_scene)
 
-        # origin
-        if self.origin_xy_mode == "zero":
-            x0 = 0.0; y0 = 0.0
+        off = self.frequencies - self.fc_hz
+        if (off[0] < 0) and (off[-1] > 0) and np.all(np.diff(off) > 0):
+            self.fft_shift = True
         else:
-            x0 = float(bbox.min.x); y0 = float(bbox.min.y)
+            self.fft_shift = False
+
+            # origin
+            if self.origin_xy_mode == "zero":
+                x0 = 0.0; y0 = 0.0
+            else:
+                x0 = float(bbox.min.x); y0 = float(bbox.min.y)
 
         z_min = float(bbox.min.z); z_max = float(bbox.max.z)
         total_span = (self.K - 1) * self.z_step_m
@@ -187,14 +209,28 @@ class UNetTdlPropagator:
         x_stack = x.transpose(0, 2, 1, 3, 4).reshape(1, self.K * c_in, self.H, self.W)
         x_chw = x_stack[0]  # (K*c_in,H,W)
 
-        # --- critical channel count check ---
+        if self.keep_idx is not None:
+            if self.keep_idx.size != self.C_model:
+                raise RuntimeError(
+                    f"keep_idx size={self.keep_idx.size} but model expects C_model={self.C_model}. "
+                    "Your norm_stats/model are inconsistent."
+                )
+            x_chw = x_chw[self.keep_idx, :, :]
+
         if x_chw.shape[0] != self.C_model:
-            raise RuntimeError(
-                f"UNet input channel mismatch: built K*c_in={x_chw.shape[0]} channels "
-                f"(K={self.K}, c_in={c_in}) but model expects C_model={self.C_model} "
-                f"(from norm_stats.x_mean). "
-                f"This usually means your training used channel selection/reordering, but meta.json doesn't record it."
-            )
+            if self.keep_idx is not None:
+                raise RuntimeError(
+                    f"Internal inconsistency: keep_idx size={self.keep_idx.size} "
+                    f"but resulting x_chw has {x_chw.shape[0]} channels, expected {self.C_model}. "
+                    "This suggests keep_idx is malformed."
+                )
+            else:
+                raise RuntimeError(
+                    f"UNet input channel mismatch: built K*c_in={x_chw.shape[0]} channels "
+                    f"(K={self.K}, c_in={c_in}) but model expects C_model={self.C_model} "
+                    f"(from norm_stats.x_mean). "
+                    f"This usually means your training used channel selection/reordering, but meta.json doesn't record it."
+                )
 
         x_t = torch.from_numpy(x_chw).to(self.device)
         pred = self._forward(x_t)  # (Y_model,H,W)
@@ -253,13 +289,14 @@ class UNetTdlPropagator:
         return float(wb), float(tau), (None if ex is None else float(ex))
 
     def synthesize_cfr(self, tau_rms_ns: float, seed: int) -> np.ndarray:
+        
         N = self.fft_size
         df = self.subcarrier_spacing_hz
         Ts = 1.0 / (N * df)
 
         tau = max(float(tau_rms_ns), 1e-3) * 1e-9
         L = int(np.clip(np.ceil(6.0 * tau / Ts), 1, N))
-
+        print(f"tau_rms_ns={tau_rms_ns:.6f} -> L={L}, Ts(ns)={Ts*1e9:.3f}")
         t = np.arange(L, dtype=np.float64) * Ts
         p = np.exp(-t / max(tau, 1e-12))
         p = p / (p.sum() + 1e-12)
@@ -433,7 +470,7 @@ class SionnaEnv:
                     z_margin_m=0.625 * 0.5,   # if training used z_margin=0.5 cells
                     origin_xy_mode="bbox_min", # or "zero" if your scenes are 0-based
                 )
-            self._unet.attach_scene(self.scene, self.bbox, self.fc, self.fft_size, self.subcarrier_spacing)
+            self._unet.attach_scene(self.scene, self.bbox, self.fc, self.fft_size, self.subcarrier_spacing, self.frequencies)
 
         # configure mobility models
         self._init_mobility(sim_init_msg)
@@ -922,6 +959,7 @@ class SionnaEnv:
 
                 # normalized CFR from G(tau_rms)
                 seed = (int(self.my_seed) * 1315423911) ^ (int(tx_node) * 2654435761) ^ (int(curr_rx_node) * 97531) ^ (int(self.sim_time) & 0xffffffff)
+                print(f"rx={curr_rx_node} wb={wb_db:.1f}dB tau_rms={tau_rms_ns:.4f} ns (raw from net)")
                 h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, seed=seed)
 
                 # sanity: mean |H|^2 ~ 1
@@ -1139,7 +1177,7 @@ if __name__ == '__main__':
     parser.add_argument("--default_mode", type=int, default=SionnaEnv.MODE_P2MP, help="Which mode to use if not set by ns3")
     parser.add_argument("--rt_fast", help="Use simplified raytracing for faster computations", action='store_true')
     parser.add_argument("--rt_max_parallel_links", type=int, default=256, help="Max no. of link simulated at once; depends on GPU memory")
-    parser.add_argument("--est_csi", help="Whether to estimate complex CSI per OFDM subcarrier", type=bool, default=False)
+    parser.add_argument("--est_csi", action="store_true", help="Send CSI vectors (needed for spectrum model)")
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
 
     parser.add_argument("--use_unet", action="store_true", help="Use U-Net surrogate instead of Sionna ray tracing")
