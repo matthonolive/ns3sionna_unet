@@ -283,6 +283,9 @@ class UNetTdlPropagator:
         kf = (rx[2] - z0) / self.z_step_m
 
         maps = self._cached_maps  # (K,3,H,W)
+
+        if (xf < 0 or xf > self.W-1 or yf < 0 or yf > self.H-1 or kf < 0 or kf > self.K-1):
+            print(f"[warn] RX outside grid -> clamping: xf={xf:.2f}, yf={yf:.2f}, kf={kf:.2f}, rx={rx}")
         wb = self._trilerp(maps[:, self.y_wb_idx, :, :], kf, yf, xf)
         tau = self._trilerp(maps[:, self.y_tau_rms_idx, :, :], kf, yf, xf)
         ex = self._trilerp(maps[:, self.y_excess_idx, :, :], kf, yf, xf) if self.y_excess_idx >= 0 else None
@@ -296,7 +299,6 @@ class UNetTdlPropagator:
 
         tau = max(float(tau_rms_ns), 1e-3) * 1e-9
         L = int(np.clip(np.ceil(6.0 * tau / Ts), 1, N))
-        print(f"tau_rms_ns={tau_rms_ns:.6f} -> L={L}, Ts(ns)={Ts*1e9:.3f}")
         t = np.arange(L, dtype=np.float64) * Ts
         p = np.exp(-t / max(tau, 1e-12))
         p = p / (p.sum() + 1e-12)
@@ -959,7 +961,19 @@ class SionnaEnv:
 
                 # normalized CFR from G(tau_rms)
                 seed = (int(self.my_seed) * 1315423911) ^ (int(tx_node) * 2654435761) ^ (int(curr_rx_node) * 97531) ^ (int(self.sim_time) & 0xffffffff)
-                print(f"rx={curr_rx_node} wb={wb_db:.1f}dB tau_rms={tau_rms_ns:.4f} ns (raw from net)")
+                print(f"rx={curr_rx_node} wb={wb_db:.1f}dB")
+
+                #Testing physical laws
+                delay_ns = base_ns + ex
+                delay_int_ns = int(round(delay_ns))
+
+                print(
+                    f"[CFR] tx={tx_node} rx={curr_rx_node} "
+                    f"d={d_m:.3f} m "
+                    f"delay={delay_int_ns} ns (raw={delay_ns:.3f}; base={base_ns:.3f}+ex={ex:.3f}) "
+                    f"tau_rms={tau_rms_ns:.4f} ns"
+                )
+                
                 h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, seed=seed)
 
                 # sanity: mean |H|^2 ~ 1
