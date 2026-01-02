@@ -953,7 +953,7 @@ class SionnaEnv:
             a_flat = np.squeeze(a_link).reshape(-1)
             tau_flat = np.squeeze(tau_link).reshape(-1)
 
-            m = np.isfinite(tau_flat) & (tau_flat > 0) & np.isfinite(a_flat)
+            m = np.isfinite(tau_flat) & (tau_flat >= 0) & np.isfinite(a_flat)
             if not np.any(m):
                 return 0.0
             
@@ -1033,6 +1033,12 @@ class SionnaEnv:
         # create pathsolver; todo: check reuse
         p_solver  = PathSolver()
 
+        #Deterministic seed based on link and time if you feel so inclined 
+
+        a = int(min(tx_node, rx_nodes[0]))
+        b = int(max(tx_node, rx_nodes[0]))
+        rt_seed = (int(self.my_seed) * 1315423911) ^ (a * 2654435761) ^ (b * 97531)
+
         # Compute propagation paths
         paths = p_solver(scene=self.scene,
                          max_depth=self.rt_max_depth,
@@ -1044,7 +1050,7 @@ class SionnaEnv:
                          synthetic_array=self.rt_synthetic_array,
                          diffraction=self.rt_diffraction,  # costly
                          edge_diffraction=self.rt_edge_diffraction,  # rays that bend around edges
-                         diffraction_lit_region=self.rt_diffraction_lit_region)  # higher physical accuracy
+                         diffraction_lit_region=self.rt_diffraction_lit_region) # higher physical accuracy
 
         # AZU: sampling_frequency is only used if num_time_steps > 1
         # a: shape [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps],
