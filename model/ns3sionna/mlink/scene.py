@@ -19,6 +19,15 @@ SIONNA_SCHEMA = {
     "s": "scattering_coefficient",
 }
 
+def _coerce_frequency_hz(frequency) -> tuple[float, int]:
+    """Return (float_hz, int_hz) from Sionna/Tensor/np scalars."""
+    try:
+        f_val = float(frequency)
+    except Exception:
+        f_val = float(np.asarray(frequency).ravel()[0])
+    f_hz_i = int(np.round(f_val))
+    return f_val, f_hz_i
+
 
 @dataclass
 class Scene:
@@ -29,76 +38,71 @@ class Scene:
     sionna_scene: sionna.rt.Scene | None = None
     sionna_scene_geometry: sionna.rt.Scene | None = None
 
-    def to_sionna(self, frequency: float):
-        if self.sionna_scene is not None and self.sionna_scene.frequency == frequency:
-            return self.sionna_scene
+    def to_sionna(self, frequency: float, tol_hz: float = 1.0):
+        # cache check (robust to tensor-ish frequency types)
+        if self.sionna_scene is not None:
+            try:
+                if float(self.sionna_scene.frequency) == float(frequency):
+                    return self.sionna_scene
+            except Exception:
+                pass
 
+        f_val, f_hz_i = _coerce_frequency_hz(frequency)
+
+        # group faces by material id
         material2face = defaultdict(list)
         for face_id, material_id in self.face2material.items():
-            material2face[material_id].append(face_id)
+            material2face[int(material_id)].append(int(face_id))
 
-            def _get_material_row(material_id: int) -> pl.DataFrame:
-                df = self.material_database
+        df = self.material_database
 
-                # Prefer integer Hz matching if available
-                if "frequency_hz" in df.columns:
-                    hit = df.filter((pl.col("id") == material_id) & (pl.col("frequency_hz") == f_hz_i)).head(1)
-                    if hit.height > 0:
-                        return hit
+        # Optional but recommended: ensure frequency_hz exists for stable matching
+        if "frequency_hz" not in df.columns:
+            if "frequency" in df.columns:
+                df = df.with_columns(pl.col("frequency").round(0).cast(pl.Int64).alias("frequency_hz"))
+            else:
+                df = df.with_columns(pl.lit(f_hz_i).cast(pl.Int64).alias("frequency_hz"))
+            self.material_database = df
 
-                    # fallback: closest available frequency for this id
-                    same_id = df.filter(pl.col("id") == material_id)
-                    if same_id.height > 0:
-                        same_id = same_id.with_columns((pl.col("frequency_hz") - f_hz_i).abs().alias("_df"))
-                        best = same_id.sort("_df").drop("_df").head(1)
+        def get_material_row(material_id: int) -> pl.DataFrame:
+            df = self.material_database
 
-                        # append a copied row at the requested frequency for future exact hits
-                        row = best.to_dicts()[0]
-                        row["frequency"] = float(f_val)
-                        row["frequency_hz"] = int(f_hz_i)
-                        self.material_database = pl.concat([df, pl.DataFrame([row])], how="vertical_relaxed")
-                        return pl.DataFrame([row])
+            # 1) exact integer match
+            hit = df.filter((pl.col("id") == material_id) & (pl.col("frequency_hz") == f_hz_i)).head(1)
+            if hit.height > 0:
+                return hit
 
-                # Tolerant float match on "frequency"
-                if "frequency" in df.columns:
-                    hit = df.filter(
-                        (pl.col("id") == material_id) &
-                        ((pl.col("frequency") - f_val).abs() <= float(tol_hz))
-                    ).head(1)
-                    if hit.height > 0:
-                        return hit
-
-                    # closest float frequency for this id (if frequency column exists)
-                    same_id = df.filter(pl.col("id") == material_id)
-                    if same_id.height > 0 and "frequency" in same_id.columns:
-                        same_id = same_id.with_columns((pl.col("frequency") - f_val).abs().alias("_df"))
-                        best = same_id.sort("_df").drop("_df").head(1)
-
-                        row = best.to_dicts()[0]
-                        row["frequency"] = float(f_val)
-                        if "frequency_hz" in df.columns:
-                            row["frequency_hz"] = int(f_hz_i)
-                        self.material_database = pl.concat([df, pl.DataFrame([row])], how="vertical_relaxed")
-                        return pl.DataFrame([row])
-
-                # last resort: create default row for this id at requested frequency
-                row = {
-                    "id": int(material_id),
-                    "frequency": float(f_val),
-                    "name": str(material_id),
-                    "thickness": 0.1,
-                    "permittivity": 4.0,
-                    "conductivity": 0.01,
-                }
-                if "frequency_hz" in df.columns:
-                    row["frequency_hz"] = int(f_hz_i)
-
+            # 2) nearest frequency_hz for this id (copy row to requested freq)
+            same_id = df.filter(pl.col("id") == material_id)
+            if same_id.height > 0:
+                best = (
+                    same_id.with_columns((pl.col("frequency_hz") - f_hz_i).abs().alias("_df"))
+                        .sort("_df")
+                        .drop("_df")
+                        .head(1)
+                )
+                row = best.to_dicts()[0]
+                row["frequency"] = float(f_val)
+                row["frequency_hz"] = int(f_hz_i)
                 self.material_database = pl.concat([df, pl.DataFrame([row])], how="vertical_relaxed")
                 return pl.DataFrame([row])
 
+            # 3) last resort: create a default row
+            row = {
+                "id": int(material_id),
+                "frequency": float(f_val),
+                "frequency_hz": int(f_hz_i),
+                "name": str(material_id),
+                "thickness": 0.1,
+                "permittivity": 4.0,
+                "conductivity": 0.01,
+            }
+            self.material_database = pl.concat([df, pl.DataFrame([row])], how="vertical_relaxed")
+            return pl.DataFrame([row])
+
         meshes = []
         for material_id, face_list in material2face.items():
-            material_data = _get_material_row(material_id)  # always 1 row now
+            material_data = get_material_row(material_id)  # guaranteed 1 row
 
             sionna_material = sionna.rt.RadioMaterial(
                 name=material_data[0, "name"],
@@ -107,42 +111,33 @@ class Scene:
                 conductivity=float(material_data[0, "conductivity"]),
             )
 
-            single_material_meshes = self.mesh.submesh([face_list], append=False)
-            assert isinstance(single_material_meshes, list)
-            meshes.extend([trimesh2mitsuba(m, sionna_material) for m in single_material_meshes])
+            sub = self.mesh.submesh([face_list], append=False)
+            meshes.extend([trimesh2mitsuba(m, sionna_material) for m in sub])
 
-            assert len(meshes) > 0
-            mi_scene = mi.load_dict(
-                {
-                    "type": "scene",
-                    "integrator": {"type": "path"},
-                }
-                | {f"mesh_{i}": mesh for i, mesh in enumerate(meshes)}
-            )
+        if len(meshes) == 0:
+            raise ValueError("No meshes were produced (check face2material / mesh).")
 
-        assert isinstance(mi_scene, mi.Scene)
-        si_scene = sionna.rt.Scene(mi_scene)
-
-        si_scene.tx_array = sionna.rt.PlanarArray(
-            num_rows=1, num_cols=1, pattern="iso", polarization="V"
+        # build ONE mitsuba scene
+        mi_scene = mi.load_dict(
+            {"type": "scene", "integrator": {"type": "path"}}
+            | {f"mesh_{i}": mesh for i, mesh in enumerate(meshes)}
         )
+        assert isinstance(mi_scene, mi.Scene)
+
+        si_scene = sionna.rt.Scene(mi_scene)
+        si_scene.tx_array = sionna.rt.PlanarArray(num_rows=1, num_cols=1, pattern="iso", polarization="V")
         si_scene.rx_array = si_scene.tx_array
 
+        # add TX/RX nodes
         for i, tx_coord in enumerate(self.antenna_database.tx_coords):
-            name = f"transmitter_{i:03d}"
-            position = mi.Point3f(tx_coord)
-            transmitter = sionna.rt.Transmitter(name, position)
-            si_scene.add(transmitter)
-
+            si_scene.add(sionna.rt.Transmitter(f"transmitter_{i:03d}", mi.Point3f(tx_coord)))
         for i, rx_coord in enumerate(self.antenna_database.rx_coords):
-            name = f"receiver_{i:03d}"
-            position = mi.Point3f(rx_coord)
-            receiver = sionna.rt.Receiver(name, position)
-            si_scene.add(receiver)
+            si_scene.add(sionna.rt.Receiver(f"receiver_{i:03d}", mi.Point3f(rx_coord)))
 
-        si_scene.frequency = frequency
+        si_scene.frequency = float(f_val)
         self.sionna_scene = si_scene
         return si_scene
+
 
     @classmethod
     def from_sionna(cls, scene: sionna.rt.Scene):
@@ -241,49 +236,49 @@ class Scene:
         )
     
     
-    def to_sionna_geometry(self, frequency: float):
-        """
-        Build geometry + radio materials ONLY.
-        Does NOT add transmitters/receivers.
-        """
-        if self.sionna_scene_geometry is not None and self.sionna_scene_geometry.frequency == frequency:
-            return self.sionna_scene_geometry
+    def to_sionna_geometry(self, frequency: float, tol_hz: float = 1.0):
+        """Build geometry + radio materials ONLY (no TX/RX nodes)."""
+        if self.sionna_scene_geometry is not None:
+            try:
+                if float(self.sionna_scene_geometry.frequency) == float(frequency):
+                    return self.sionna_scene_geometry
+            except Exception:
+                pass
+
+        f_val, f_hz_i = _coerce_frequency_hz(frequency)
 
         material2face = defaultdict(list)
         for face_id, material_id in self.face2material.items():
-            material2face[material_id].append(face_id)
+            material2face[int(material_id)].append(int(face_id))
 
-        def get_material_row(material_id: int):
-            df = self.material_database
-
-            # prefer integer frequency match if column exists
-            if "frequency_hz" in df.columns:
-                hit = df.filter((pl.col("id") == material_id) & (pl.col("frequency_hz") == f_hz_i)).head(1)
-                if hit.height > 0:
-                    return hit
-
-                # nearest frequency for this id
-                same_id = df.filter(pl.col("id") == material_id)
-                if same_id.height > 0:
-                    same_id = same_id.with_columns((pl.col("frequency_hz") - f_hz_i).abs().alias("_df"))
-                    best = same_id.sort("_df").drop("_df").head(1)
-                    # append a copy at requested frequency for future exact hits
-                    row = best.to_dicts()[0]
-                    row["frequency"] = f_val
-                    row["frequency_hz"] = f_hz_i
-                    self.material_database = pl.concat([df, pl.DataFrame([row])], how="vertical_relaxed")
-                    return pl.DataFrame([row])
-
-            # fallback: tolerant float match on "frequency"
+        df = self.material_database
+        if "frequency_hz" not in df.columns:
             if "frequency" in df.columns:
-                hit = df.filter(
-                    (pl.col("id") == material_id) &
-                    ((pl.col("frequency") - f_val).abs() <= float(tol_hz))
-                ).head(1)
-                if hit.height > 0:
-                    return hit
+                df = df.with_columns(pl.col("frequency").round(0).cast(pl.Int64).alias("frequency_hz"))
+            else:
+                df = df.with_columns(pl.lit(f_hz_i).cast(pl.Int64).alias("frequency_hz"))
+            self.material_database = df
 
-            # last resort: create default and append
+        def get_material_row(material_id: int) -> pl.DataFrame:
+            df = self.material_database
+            hit = df.filter((pl.col("id") == material_id) & (pl.col("frequency_hz") == f_hz_i)).head(1)
+            if hit.height > 0:
+                return hit
+
+            same_id = df.filter(pl.col("id") == material_id)
+            if same_id.height > 0:
+                best = (
+                    same_id.with_columns((pl.col("frequency_hz") - f_hz_i).abs().alias("_df"))
+                        .sort("_df")
+                        .drop("_df")
+                        .head(1)
+                )
+                row = best.to_dicts()[0]
+                row["frequency"] = float(f_val)
+                row["frequency_hz"] = int(f_hz_i)
+                self.material_database = pl.concat([df, pl.DataFrame([row])], how="vertical_relaxed")
+                return pl.DataFrame([row])
+
             row = {
                 "id": int(material_id),
                 "frequency": float(f_val),
@@ -291,21 +286,14 @@ class Scene:
                 "name": str(material_id),
                 "thickness": 0.1,
                 "permittivity": 4.0,
-                "permeability": 1.0,
                 "conductivity": 0.01,
-                "transmission_loss_vertical": 10.0,
-                "transmission_loss_horizontal": 20.0,
-                "reflection_loss": 9.0,
-                "diffraction_loss_min": 8.0,
-                "diffraction_loss_max": 15.0,
-                "diffraction_loss": 5.0,
             }
             self.material_database = pl.concat([df, pl.DataFrame([row])], how="vertical_relaxed")
             return pl.DataFrame([row])
 
         meshes = []
         for material_id, face_list in material2face.items():
-            material_data = get_material_row(material_id)  # always returns 1-row df now
+            material_data = get_material_row(material_id)
 
             sionna_material = sionna.rt.RadioMaterial(
                 name=material_data[0, "name"],
@@ -314,11 +302,11 @@ class Scene:
                 conductivity=float(material_data[0, "conductivity"]),
             )
 
-            single_material_meshes = self.mesh.submesh([face_list], append=False)
-            assert isinstance(single_material_meshes, list)
-            meshes.extend([trimesh2mitsuba(m, sionna_material) for m in single_material_meshes])
+            sub = self.mesh.submesh([face_list], append=False)
+            meshes.extend([trimesh2mitsuba(m, sionna_material) for m in sub])
 
-        assert len(meshes) > 0
+        if len(meshes) == 0:
+            raise ValueError("No meshes were produced (check face2material / mesh).")
 
         mi_scene = mi.load_dict(
             {"type": "scene", "integrator": {"type": "path"}}
@@ -329,7 +317,7 @@ class Scene:
         si_scene = sionna.rt.Scene(mi_scene)
         si_scene.tx_array = sionna.rt.PlanarArray(num_rows=1, num_cols=1, pattern="iso", polarization="V")
         si_scene.rx_array = si_scene.tx_array
-        si_scene.frequency = frequency
+        si_scene.frequency = float(f_val)
 
         self.sionna_scene_geometry = si_scene
         return si_scene
