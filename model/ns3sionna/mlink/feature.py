@@ -128,7 +128,7 @@ def ray_features(
             "Receiver coordinates must be initialized with an `AntennaGrid` object for tensorial features."
         )
 
-    mi_scene = scene.to_sionna(frequency).mi_scene
+    mi_scene = scene.to_sionna_geometry(frequency).mi_scene
     assert isinstance(mi_scene, mi.Scene)
 
     per_wall_loss = build_transmission_coeffs(mi_scene, frequency)
