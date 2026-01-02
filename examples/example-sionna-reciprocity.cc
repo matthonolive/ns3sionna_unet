@@ -1,216 +1,307 @@
-#include "ns3/command-line.h"
-#include "ns3/config.h"
+/*
+ * Reciprocity test for ns3sionna + SpectrumPropagationLoss
+ *
+ * Two WiFi nodes (AP + STA), both run UDP EchoServer and EchoClient so that
+ * packets go both directions and trigger CSI/CFR requests both ways.
+ *
+ * Goal: check that tau_rms printed inside ns3unet_spectrum.py is identical
+ * for both directions (channel reciprocity), for static nodes.
+ */
+
+#include <iostream>
+#include <map>
+#include <string>
+
+// Sionna models
+#include "ns3/sionna-helper.h"
+#include "ns3/sionna-propagation-cache.h"
+#include "ns3/sionna-propagation-delay-model.h"
+#include "ns3/sionna-propagation-loss-model.h"
+#include "ns3/sionna-spectrum-propagation-loss-model.h"
+#include "ns3/cfr-tag.h"
+
+// ns-3 modules
+#include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/internet-module.h"
-#include "ns3/ipv4-address-helper.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
 #include "ns3/spectrum-module.h"
-#include "ns3/udp-echo-helper.h"
-#include "ns3/wifi-module.h"
-
-// sionna
-#include "ns3/sionna-module.h"
-
-#include <fstream>
-#include <iomanip>
-#include <map>
-#include <sstream>
-#include <string>
+#include "ns3/spectrum-wifi-helper.h"
+#include "ns3/ssid.h"
+#include "ns3/wifi-spectrum-phy-interface.h"
 
 using namespace ns3;
 
-static uint32_t
-NodeIdFromIp (Ipv4Address ip)
-{
-  // Assumes your addressing is 10.1.1.(nodeId+1) like in the sensing example
-  const std::string s = ip.ToString ();
-  // last octet
-  const auto lastDot = s.find_last_of ('.');
-  if (lastDot == std::string::npos) return 0;
-  const int last = std::stoi (s.substr (lastDot + 1));
-  return (last > 0) ? static_cast<uint32_t> (last - 1) : 0;
-}
+NS_LOG_COMPONENT_DEFINE("ExampleSionnaReciprocity");
+
+// Optional: map IPv4->NodeId for nicer logging
+static std::map<Ipv4Address, uint32_t> g_ipToNodeId;
 
 static void
-DumpCfrCsv (Ptr<const Packet> packet, const Address &from, const Address &to, uint32_t rxNodeId)
+BuildIpToNodeIdMap()
 {
-  CFRTag tag;
-  if (!packet->PeekPacketTag (tag))
+    g_ipToNodeId.clear();
+    for (uint32_t i = 0; i < NodeList::GetNNodes(); ++i)
     {
-      return;
+        Ptr<Node> node = NodeList::GetNode(i);
+        Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+        if (!ipv4) continue;
+
+        for (uint32_t j = 0; j < ipv4->GetNInterfaces(); ++j)
+        {
+            for (uint32_t k = 0; k < ipv4->GetNAddresses(j); ++k)
+            {
+                Ipv4Address addr = ipv4->GetAddress(j, k).GetLocal();
+                if (!addr.IsLocalhost())
+                {
+                    g_ipToNodeId[addr] = node->GetId();
+                }
+            }
+        }
     }
+}
 
-  const auto fromInet = InetSocketAddress::ConvertFrom (from);
-  const uint32_t txNodeId = NodeIdFromIp (fromInet.GetIpv4 ());
+static uint32_t
+NodeIdFromIpv4(Ipv4Address a)
+{
+    auto it = g_ipToNodeId.find(a);
+    if (it == g_ipToNodeId.end()) return 0xFFFFFFFF;
+    return it->second;
+}
 
-  std::ostringstream fname;
-  fname << "csi_tx" << txNodeId << "_rx" << rxNodeId << ".csv";
-  const std::string path = fname.str ();
+// Trace server RX: show direction + whether CFRTag is present
+static void
+RxTraceWithAddresses(std::string context,
+                     Ptr<const Packet> packet,
+                     const Address &from,
+                     const Address &to)
+{
+    InetSocketAddress src = InetSocketAddress::ConvertFrom(from);
+    InetSocketAddress dst = InetSocketAddress::ConvertFrom(to);
 
-  static std::map<std::string, std::unique_ptr<std::ofstream>> files;
+    uint32_t srcId = NodeIdFromIpv4(src.GetIpv4());
+    uint32_t dstId = NodeIdFromIpv4(dst.GetIpv4());
 
-  if (files.find (path) == files.end ())
+    NS_LOG_INFO(Simulator::Now().GetSeconds()
+                << "s: RX " << packet->GetSize() << "B  "
+                << src.GetIpv4() << "(" << srcId << "):" << src.GetPort()
+                << " -> "
+                << dst.GetIpv4() << "(" << dstId << "):" << dst.GetPort()
+                << "  [" << context << "]");
+
+    CFRTag tag;
+    if (packet->PeekPacketTag(tag))
     {
-      files[path] = std::make_unique<std::ofstream> (path, std::ios::out);
-      (*files[path]) << "t_s,f_hz,abs2,re,im\n";
-      (*files[path]) << std::setprecision (12);
+        auto csi = tag.GetComplexes();
+        NS_LOG_INFO("  CFRTag present: N=" << csi.size());
     }
-
-  const auto freqs = tag.GetFrequencies ();
-  const auto H = tag.GetComplexes ();
-
-  const double t = Simulator::Now ().GetSeconds ();
-
-  const uint32_t n = std::min (freqs.size (), H.size ());
-  for (uint32_t i = 0; i < n; ++i)
+    else
     {
-      const double f = freqs[i];
-      const float re = H[i].real ();
-      const float im = H[i].imag ();
-      const double abs2 = static_cast<double> (re) * re + static_cast<double> (im) * im;
-
-      (*files[path]) << t << "," << f << "," << abs2 << "," << re << "," << im << "\n";
+        NS_LOG_INFO("  (no CFRTag found on packet)");
     }
-
-  files[path]->flush ();
 }
 
 int
-main (int argc, char *argv[])
+main(int argc, char *argv[])
 {
-  std::string env = "2_rooms_with_door/2_rooms_with_door_open.xml";
-  double simTime = 2.0;
-  double txPowerDbm = 20.0;
-  bool useSpectrum = true;
+    bool verbose = true;
+    bool tracing = false;
+    bool caching = false; // IMPORTANT for reciprocity test: ensure both directions hit Python
+    std::string environment = "2_rooms_with_door/2_rooms_with_door_open.xml";
 
-  CommandLine cmd (__FILE__);
-  cmd.AddValue ("env", "Scene XML under models/", env);
-  cmd.AddValue ("simTime", "Simulation time [s]", simTime);
-  cmd.AddValue ("txPowerDbm", "TX power [dBm]", txPowerDbm);
-  cmd.AddValue ("useSpectrum", "Use spectrum propagation model", useSpectrum);
-  cmd.Parse (argc, argv);
+    int wifi_channel_num = 42;   // center ~5210 MHz
+    int channelWidth = 80;       // MHz
+    double txPowerDbm = 20.0;
 
-  // ---- nodes: 1 STA + 1 AP ----
-  NodeContainer wifiStaNodes;
-  wifiStaNodes.Create (1);
-  NodeContainer wifiApNode;
-  wifiApNode.Create (1);
+    double simTime = 3.0;
 
-  // ---- mobility (fixed) ----
-  MobilityHelper mobility;
-  mobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
-  mobility.Install (wifiStaNodes);
-  mobility.Install (wifiApNode);
+    // App setup
+    uint32_t maxPackets = 1;
+    double interval_s = 0.2;
+    uint32_t pktSize = 1024;
+    uint16_t portA = 9000; // Node0 server
+    uint16_t portB = 9001; // Node1 server
 
-  // Choose two positions you expect to be “interesting”
-  wifiStaNodes.Get (0)->GetObject<MobilityModel> ()->SetPosition (Vector (2.0, 2.0, 1.0));
-  wifiApNode.Get (0)->GetObject<MobilityModel> ()->SetPosition (Vector (10.0, 6.0, 1.0));
+    CommandLine cmd(__FILE__);
+    cmd.AddValue("verbose", "Enable logging", verbose);
+    cmd.AddValue("tracing", "Enable pcap tracing", tracing);
+    cmd.AddValue("caching", "Enable caching inside SionnaPropagationCache", caching);
+    cmd.AddValue("environment", "Xml file of environment", environment);
+    cmd.AddValue("channel", "WiFi channel number", wifi_channel_num);
+    cmd.AddValue("channelWidth", "WiFi channel width in MHz", channelWidth);
+    cmd.AddValue("txPowerDbm", "TX power (dBm)", txPowerDbm);
+    cmd.AddValue("simTime", "Simulation time (s)", simTime);
+    cmd.AddValue("maxPackets", "Max packets per client", maxPackets);
+    cmd.AddValue("interval", "Client interval (s)", interval_s);
+    cmd.AddValue("packetSize", "UDP packet size (B)", pktSize);
+    cmd.Parse(argc, argv);
 
-  // ---- wifi + spectrum channel ----
-  WifiHelper wifi;
-  wifi.SetStandard (WIFI_STANDARD_80211ax);
-
-  SpectrumWifiPhyHelper phy;
-  phy.Set ("TxPowerStart", DoubleValue (txPowerDbm));
-  phy.Set ("TxPowerEnd", DoubleValue (txPowerDbm));
-
-  Ptr<MultiModelSpectrumChannel> spectrumChannel = CreateObject<MultiModelSpectrumChannel> ();
-
-  // Sionna cache (talks to your python server)
-  Ptr<SionnaPropagationCache> propagationCache = CreateObject<SionnaPropagationCache> ();
-  propagationCache->SetAttribute ("ModelType", StringValue ("position"));
-  propagationCache->SetAttribute ("Scene", StringValue (env));
-  propagationCache->SetAttribute ("MaxCacheSize", UintegerValue (1000000));
-  propagationCache->SetAttribute ("MinTc", TimeValue (MilliSeconds (100000))); // big => static
-  spectrumChannel->AddPropagationLossModel (propagationCache);
-
-  if (useSpectrum)
+    if (verbose)
     {
-      Ptr<SionnaSpectrumPropagationLossModel> sionnaSpectrumLoss = CreateObject<SionnaSpectrumPropagationLossModel> ();
-      sionnaSpectrumLoss->SetPropagationCache (propagationCache);
-      spectrumChannel->AddSpectrumPropagationLossModel (sionnaSpectrumLoss);
+        LogComponentEnable("ExampleSionnaReciprocity", LOG_INFO);
+        LogComponentEnable("SionnaPropagationDelayModel", LOG_INFO);
+        LogComponentEnable("SionnaPropagationLossModel", LOG_INFO);
+        LogComponentEnable("SionnaPropagationCache", LOG_INFO);
+        LogComponentEnable("SionnaSpectrumPropagationLossModel", LOG_INFO);
     }
 
-  phy.SetChannel (spectrumChannel);
+    std::cout << "ns3sionna reciprocity test (2 nodes, bidirectional UDP)\n\n";
 
-  WifiMacHelper mac;
-  Ssid ssid = Ssid ("reciprocity-ssid");
+    // --- Sionna helper (Python server must be listening on tcp://localhost:5555) ---
+    SionnaHelper sionnaHelper(environment, "tcp://localhost:5555");
 
-  mac.SetType ("ns3::StaWifiMac",
-               "Ssid", SsidValue (ssid),
-               "ActiveProbing", BooleanValue (false));
-  NetDeviceContainer staDevice = wifi.Install (phy, mac, wifiStaNodes);
+    // --- Nodes: Node0 = AP, Node1 = STA ---
+    NodeContainer staNode;
+    staNode.Create(1);
 
-  mac.SetType ("ns3::ApWifiMac",
-               "Ssid", SsidValue (ssid));
-  NetDeviceContainer apDevice = wifi.Install (phy, mac, wifiApNode);
+    NodeContainer apNode;
+    apNode.Create(1);
 
-  // ---- internet ----
-  InternetStackHelper stack;
-  stack.Install (wifiStaNodes);
-  stack.Install (wifiApNode);
+    NodeContainer allNodes;
+    allNodes.Add(apNode);
+    allNodes.Add(staNode);
 
-  Ipv4AddressHelper address;
-  address.SetBase ("10.1.1.0", "255.255.255.0");
-  Ipv4InterfaceContainer staIf = address.Assign (staDevice);
-  Ipv4InterfaceContainer apIf = address.Assign (apDevice);
+    // --- Cache ---
+    Ptr<SionnaPropagationCache> propagationCache = CreateObject<SionnaPropagationCache>();
+    propagationCache->SetSionnaHelper(sionnaHelper);
+    propagationCache->SetCaching(caching);
 
-  // ---- apps: echo server on BOTH ends, and one client each direction ----
-  const uint16_t portAp = 9;
-  const uint16_t portSta = 10;
+    // --- Spectrum channel with (loss + spectrum loss + delay) ---
+    Ptr<MultiModelSpectrumChannel> spectrumChannel = CreateObject<MultiModelSpectrumChannel>();
 
-  // Server on AP (receives STA->AP)
-  UdpEchoServerHelper apServer (portAp);
-  ApplicationContainer apServerApp = apServer.Install (wifiApNode.Get (0));
-  apServerApp.Start (Seconds (0.2));
-  apServerApp.Stop (Seconds (simTime));
+    Ptr<SionnaPropagationLossModel> lossModel = CreateObject<SionnaPropagationLossModel>();
+    lossModel->SetPropagationCache(propagationCache);
+    spectrumChannel->AddPropagationLossModel(lossModel);
 
-  // Server on STA (receives AP->STA)
-  UdpEchoServerHelper staServer (portSta);
-  ApplicationContainer staServerApp = staServer.Install (wifiStaNodes.Get (0));
-  staServerApp.Start (Seconds (0.2));
-  staServerApp.Stop (Seconds (simTime));
+    Ptr<SionnaSpectrumPropagationLossModel> spectrumLossModel = CreateObject<SionnaSpectrumPropagationLossModel>();
+    spectrumLossModel->SetPropagationCache(propagationCache);
+    spectrumChannel->AddSpectrumPropagationLossModel(spectrumLossModel);
 
-  // Client on STA sending to AP
-  UdpEchoClientHelper staToAp (apIf.GetAddress (0), portAp);
-  staToAp.SetAttribute ("MaxPackets", UintegerValue (1));
-  staToAp.SetAttribute ("Interval", TimeValue (Seconds (1.0)));
-  staToAp.SetAttribute ("PacketSize", UintegerValue (1000));
-  ApplicationContainer staClientApp = staToAp.Install (wifiStaNodes.Get (0));
-  staClientApp.Start (Seconds (1.0));
-  staClientApp.Stop (Seconds (simTime));
+    Ptr<SionnaPropagationDelayModel> delayModel = CreateObject<SionnaPropagationDelayModel>();
+    delayModel->SetPropagationCache(propagationCache);
+    spectrumChannel->SetPropagationDelayModel(delayModel);
 
-  // Client on AP sending to STA (offset slightly to avoid same-slot weirdness)
-  UdpEchoClientHelper apToSta (staIf.GetAddress (0), portSta);
-  apToSta.SetAttribute ("MaxPackets", UintegerValue (1));
-  apToSta.SetAttribute ("Interval", TimeValue (Seconds (1.0)));
-  apToSta.SetAttribute ("PacketSize", UintegerValue (1000));
-  ApplicationContainer apClientApp = apToSta.Install (wifiApNode.Get (0));
-  apClientApp.Start (Seconds (1.000001));
-  apClientApp.Stop (Seconds (simTime));
+    // --- WiFi PHY/MAC using SpectrumWifiPhyHelper ---
+    Config::Set("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phy/ChannelWidth",
+                UintegerValue(channelWidth));
 
-  // ---- CFRTag dumping on BOTH receivers ----
-  const uint32_t staId = wifiStaNodes.Get (0)->GetId ();
-  const uint32_t apId = wifiApNode.Get (0)->GetId ();
+    SpectrumWifiPhyHelper spectrumPhy;
+    spectrumPhy.SetChannel(spectrumChannel);
+    spectrumPhy.SetErrorRateModel("ns3::NistErrorRateModel");
+    spectrumPhy.Set("TxPowerStart", DoubleValue(txPowerDbm));
+    spectrumPhy.Set("TxPowerEnd", DoubleValue(txPowerDbm));
 
-  // AP echo server RxWithAddresses => logs tx=STA, rx=AP
-  {
-    std::ostringstream p;
-    p << "/NodeList/" << apId << "/ApplicationList/0/$ns3::UdpEchoServer/RxWithAddresses";
-    Config::ConnectWithoutContext (p.str (), MakeBoundCallback (&DumpCfrCsv, apId));
-  }
+    WifiHelper wifi;
+    WifiStandard wifi_standard = WIFI_STANDARD_80211ax;
+    wifi.SetStandard(wifi_standard);
 
-  // STA echo server RxWithAddresses => logs tx=AP, rx=STA
-  {
-    std::ostringstream p;
-    p << "/NodeList/" << staId << "/ApplicationList/0/$ns3::UdpEchoServer/RxWithAddresses";
-    Config::ConnectWithoutContext (p.str (), MakeBoundCallback (&DumpCfrCsv, staId));
-  }
+    WifiMacHelper mac;
+    Ssid ssid = Ssid("reciprocity-ssid");
 
-  Simulator::Stop (Seconds (simTime));
-  Simulator::Run ();
-  Simulator::Destroy ();
+    std::string channelStr =
+        "{" + std::to_string(wifi_channel_num) + ", " + std::to_string(channelWidth) + ", BAND_5GHZ, 0}";
 
-  return 0;
+    NetDeviceContainer staDev, apDev;
+
+    mac.SetType("ns3::StaWifiMac",
+                "Ssid", SsidValue(ssid),
+                "ActiveProbing", BooleanValue(false));
+    spectrumPhy.Set("ChannelSettings", StringValue(channelStr));
+    staDev = wifi.Install(spectrumPhy, mac, staNode);
+
+    mac.SetType("ns3::ApWifiMac",
+                "Ssid", SsidValue(ssid),
+                "BeaconGeneration", BooleanValue(true),
+                "BeaconInterval", TimeValue(Seconds(1.024)),
+                "EnableBeaconJitter", BooleanValue(false));
+    spectrumPhy.Set("ChannelSettings", StringValue(channelStr));
+    apDev = wifi.Install(spectrumPhy, mac, apNode);
+
+    // --- Mobility: fixed, using SionnaMobilityModel ---
+    MobilityHelper mobility;
+    mobility.SetMobilityModel("ns3::SionnaMobilityModel");
+    mobility.Install(allNodes);
+
+    // Positions (edit as you like)
+    apNode.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(1.0, 2.0, 1.0));   // Node0 (AP)
+    staNode.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(5.0, 2.0, 1.0));  // Node1 (STA)
+
+    // --- Internet stack ---
+    InternetStackHelper stack;
+    stack.Install(allNodes);
+
+    Ipv4AddressHelper address;
+    address.SetBase("10.1.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer apIf = address.Assign(apDev);
+    Ipv4InterfaceContainer staIf = address.Assign(staDev);
+
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+    BuildIpToNodeIdMap();
+
+    // --- Applications: BOTH nodes have server + client (forces traffic both ways) ---
+    // Node0(AP) server on portA
+    UdpEchoServerHelper servA(portA);
+    ApplicationContainer servAppsA = servA.Install(apNode.Get(0));
+    servAppsA.Start(Seconds(0.5));
+    servAppsA.Stop(Seconds(simTime));
+
+    // Node1(STA) server on portB
+    UdpEchoServerHelper servB(portB);
+    ApplicationContainer servAppsB = servB.Install(staNode.Get(0));
+    servAppsB.Start(Seconds(0.5));
+    servAppsB.Stop(Seconds(simTime));
+
+    // Trace server RX to confirm CFRTag presence (optional)
+    Config::Connect("/NodeList/*/ApplicationList/*/$ns3::UdpEchoServer/RxWithAddresses",
+                    MakeCallback(&RxTraceWithAddresses));
+
+    // Node1(STA) client -> Node0(AP) server portA
+    UdpEchoClientHelper cliToA(apIf.GetAddress(0), portA);
+    cliToA.SetAttribute("MaxPackets", UintegerValue(maxPackets));
+    cliToA.SetAttribute("Interval", TimeValue(Seconds(interval_s)));
+    cliToA.SetAttribute("PacketSize", UintegerValue(pktSize));
+    ApplicationContainer cliAppsToA = cliToA.Install(staNode.Get(0));
+    cliAppsToA.Start(Seconds(1.0));
+    cliAppsToA.Stop(Seconds(simTime));
+
+    // Node0(AP) client -> Node1(STA) server portB
+    UdpEchoClientHelper cliToB(staIf.GetAddress(0), portB);
+    cliToB.SetAttribute("MaxPackets", UintegerValue(maxPackets));
+    cliToB.SetAttribute("Interval", TimeValue(Seconds(interval_s)));
+    cliToB.SetAttribute("PacketSize", UintegerValue(pktSize));
+    ApplicationContainer cliAppsToB = cliToB.Install(apNode.Get(0));
+    cliAppsToB.Start(Seconds(1.0));
+    cliAppsToB.Stop(Seconds(simTime));
+
+    // --- Configure Sionna OFDM params from device ---
+    double fc = get_center_freq(apDev.Get(0));
+    sionnaHelper.Configure(fc,
+                           channelWidth,
+                           getFFTSize(wifi_standard, channelWidth),
+                           getSubcarrierSpacing(wifi_standard));
+
+    // Ensure we only compute the requested link(s)
+    sionnaHelper.SetMode(SionnaHelper::MODE_P2P);
+
+    if (tracing)
+    {
+        std::cout << "Writing pcap files ...\n";
+        spectrumPhy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
+        spectrumPhy.EnablePcap("example-sionna-reciprocity", apDev.Get(0));
+        spectrumPhy.EnablePcap("example-sionna-reciprocity", staDev.Get(0));
+    }
+
+    Simulator::Stop(Seconds(simTime));
+
+    // Start ns3sionna helper (connects to Python server)
+    sionnaHelper.Start();
+
+    Simulator::Run();
+    Simulator::Destroy();
+
+    propagationCache->PrintStats();
+    sionnaHelper.Destroy();
+
+    return 0;
 }
