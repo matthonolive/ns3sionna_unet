@@ -81,3 +81,9 @@ build_lib_example(
         SOURCE_FILES example-sionna-unet-compare.cc
         LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
 )
+
+build_lib_example(
+        NAME ns3sionna-example-sionna-reciprocity
+        SOURCE_FILES example-sionna-unet-compare.cc
+        LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
+)
