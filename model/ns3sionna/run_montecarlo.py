@@ -2,17 +2,24 @@
 import argparse, subprocess, sys, time, re
 from pathlib import Path
 import csv
+import os
+from datetime import datetime
+
+import socket, time
 
 RT_RE  = re.compile(r'^\[RT\]\s+tx=(\d+)\s+rx=(\d+).*?d=([\d.]+)m.*?delay=(\d+)ns.*?wb=([\d.]+)dB.*?tau_rms=([\d.]+)ns')
 CFR_RE = re.compile(r'^\[CFR\]\s+tx=(\d+)\s+rx=(\d+).*?d=([\d.]+)\s+m.*?delay=(\d+)\s+ns.*?tau_rms=([\d.]+)\s+ns')
 FRIIS_RE = re.compile(r'^\[FRIIS\]\s+tx=(\d+)\s+rx=(\d+).*?d=([\d.]+)\s+m\s+fspl=([\d.]+)\s+dB')
 
-def run_cmd(cmd, cwd=None, timeout=None):
+def run_cmd(cmd, cwd=None, timeout=None, live=False, prefix=""):
     p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     lines = []
     try:
         for line in p.stdout:
-            lines.append(line.rstrip("\n"))
+            line = line.rstrip("\n")
+            lines.append(line)
+            if live:
+                print(f"{prefix}{line}", flush=True)
         rc = p.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         p.kill()
@@ -40,6 +47,43 @@ def parse_lines(lines):
             friis.append((int(tx), int(rx), float(d), float(fspl)))
     return rows, friis
 
+### Logging functions
+def ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+def wait_for_server_ready(proc, timeout_s=20):
+    """Read server stdout until it prints the ready line, or timeout."""
+    t0 = time.time()
+    lines = []
+    while time.time() - t0 < timeout_s:
+        ln = proc.stdout.readline()
+        if not ln:
+            # process died or no output yet; tiny sleep to avoid busy loop
+            time.sleep(0.05)
+            if proc.poll() is not None:
+                break
+            continue
+        ln = ln.rstrip("\n")
+        lines.append(ln)
+        # IMPORTANT: match your server's exact print
+        if "Sionna server socket ready" in ln:
+            return True, lines
+        # if bind failed you'll see this
+        if "Address already in use" in ln or "ZMQError" in ln:
+            return False, lines
+    return False, lines
+
+
+def wait_for_port(host, port, timeout_s=30):
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        try:
+            with socket.create_connection((host, port), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite_root", required=True, help="Root containing scene dirs (each has scene.xml + placements.csv)")
@@ -57,6 +101,10 @@ def main():
     ap.add_argument("--interval", type=float, default=0.3)
     ap.add_argument("--packetSize", type=int, default=1024)
     ap.add_argument("--staIndex", type=int, default=0)
+    ap.add_argument("--progress", action="store_true", help="Print progress for each job")
+    ap.add_argument("--debug", action="store_true", help="Print full commands + extra logs")
+    ap.add_argument("--fail_fast", action="store_true", help="Stop on first failure")
+    ap.add_argument("--log_dir", default="mc_logs", help="Write per-run logs here")
 
     # UNet options
     ap.add_argument("--unet_run", default="unet", help="Run dir containing model.pt/meta.json/norm_stats.npz")
@@ -64,6 +112,9 @@ def main():
     ap.add_argument("--est_csi", action="store_true", help="Pass --est_csi to server (needed for spectrum)")
     ap.add_argument("--out_csv", default="mc_results.csv")
     args = ap.parse_args()
+
+    log_dir = Path(args.log_dir).resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     suite_root = Path(args.suite_root).resolve()
     scene_dirs = sorted([p for p in suite_root.iterdir() if p.is_dir() and (p/"scene.xml").exists() and (p/"placements.csv").exists()])
@@ -84,9 +135,17 @@ def main():
 
             for rep in range(args.reps):
                 for model in models:
+
+                    job_id = f"{scene_dir.name}_rep{rep}_{model}"
+                    if args.progress:
+                        print(f"[{ts()}] RUN {job_id} (env={rel_env}, staIndex={args.staIndex}, width={args.channelWidth})", flush=True)
+
                     # start server for rt/unet
+                    srv = None
                     server_lines = []
-                    if model in ("rt","unet"):
+                    ns3_lines = []
+
+                    if model in ("rt", "unet"):
                         srv_cmd = [
                             args.python, str(Path(args.server_py).resolve()),
                             "--model_folder", str(suite_root),
@@ -94,14 +153,25 @@ def main():
                         ]
                         if args.est_csi:
                             srv_cmd.append("--est_csi")
+                        if args.debug:
+                            srv_cmd.append("--verbose")
                         if model == "unet":
                             srv_cmd += ["--use_unet", "--unet_run", args.unet_run, "--unet_device", args.unet_device]
 
-                        # run server in background
-                        srv = subprocess.Popen(srv_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                        if args.debug:
+                            print(f"[{ts()}]  starting server: {' '.join(srv_cmd)}", flush=True)
 
-                        # give it a moment to bind
-                        time.sleep(0.25)
+                        srv = subprocess.Popen(
+                            srv_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1
+                        )
+                        
+                        ok = wait_for_port("127.0.0.1", 5555, timeout_s=60)
+                        if not ok:
+                            raise RuntimeError("Server did not open port 5555 within timeout")
 
                     ns3_cmd_str = (
                         f'{args.example} '
@@ -116,24 +186,58 @@ def main():
                         f'--caching=0 --verbose=0 --tracing=0 '
                     )
 
-                    # IMPORTANT: the C++ propModel for rt/unet is the same on ns-3 side;
-                    #            the difference is which server you started.
                     if model == "unet":
                         ns3_cmd_str = ns3_cmd_str.replace("--propModel=rt", "--propModel=unet")
 
                     ns3_cmd = [args.ns3, "run", ns3_cmd_str]
-                    rc, ns3_lines = run_cmd(ns3_cmd, cwd=str(suite_root))
+                    ns3_root = str(Path(args.ns3).resolve().parent)
 
-                    # collect server output if any
-                    if model in ("rt","unet"):
-                        # read until exit
+                    # --- run ns-3 ---
+                    if args.debug:
+                        print(f"[{ts()}]  ns-3 cmd: {' '.join(ns3_cmd)}", flush=True)
+
+                    try:
+                        rc, ns3_lines = run_cmd(ns3_cmd, cwd=ns3_root, live=args.debug, prefix=f"[ns3 {job_id}] ")
+                    finally:
+                        if srv is not None and srv.poll() is None:
+                            srv.terminate()
+                            try:
+                                srv.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                srv.kill()
+
+                    # --- collect server output (if any) ---
+                    if srv is not None and srv.stdout is not None:
+                        # read whatever the server printed
                         for ln in srv.stdout:
                             server_lines.append(ln.rstrip("\n"))
-                        srv.wait(timeout=10)
+                        try:
+                            srv.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            srv.kill()
 
-                    # parse combined logs (server is where [RT]/[CFR] lives)
                     combined = ns3_lines + server_lines
+
+                    # write log
+                    log_path = log_dir / f"{job_id}.log"
+                    with log_path.open("w") as lf:
+                        for ln in combined:
+                            lf.write(ln + "\n")
+
+                    if args.progress:
+                        print(f"[{ts()}] DONE {job_id} rc={rc} log={log_path}", flush=True)
+
+                    if rc != 0:
+                        tail = combined[-25:]
+                        print(f"[{ts()}] FAIL {job_id} rc={rc} (last 25 lines):", flush=True)
+                        for ln in tail:
+                            print("   " + ln, flush=True)
+                        if args.fail_fast:
+                            print("fail_fast enabled; stopping.", flush=True)
+                            return
                     rows, friis = parse_lines(combined)
+
+                    
 
                     # map friis by (tx,rx)
                     friis_map = {(tx,rx): fspl for (tx,rx,_,fspl) in friis}

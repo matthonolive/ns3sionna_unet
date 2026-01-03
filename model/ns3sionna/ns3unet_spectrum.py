@@ -805,6 +805,8 @@ class SionnaEnv:
         print(f'{self.sim_time / 1e9}s: Computed CSI with Tc: {round(Tc_p2mp / 1e6,2)}ms, #links: {len(rx_nodes)}')
 
         csi.end_time = self.sim_time + Tc_p2mp
+
+        print(f"[DBG] fft_size={self.fft_size} len(freqs)={len(self.frequencies)} "f"len(csi_real)={len(rx_node_info.csi_real)}")
         return len(rx_nodes)
 
 

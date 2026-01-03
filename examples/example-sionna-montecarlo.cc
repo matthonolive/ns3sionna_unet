@@ -40,7 +40,7 @@
 // friis models
 #include "ns3/propagation-loss-model.h"
 #include "ns3/friis-spectrum-propagation-loss.h"
-#include "ns3/constant-speed-propagation-delay-model.h"
+#include "ns3/propagation-delay-model.h"
 
 using namespace ns3;
 
@@ -248,7 +248,7 @@ main(int argc, char* argv[])
   mac.SetType("ns3::ApWifiMac",
               "Ssid", SsidValue(ssid),
               "BeaconGeneration", BooleanValue(true),
-              "BeaconInterval", TimeValue(Seconds(1.0)),
+              "BeaconInterval", TimeValue(MicroSeconds(1024 * 100)),
               "EnableBeaconJitter", BooleanValue(false));
   apDev = wifi.Install(spectrumPhy, mac, nodes.Get(0));
 

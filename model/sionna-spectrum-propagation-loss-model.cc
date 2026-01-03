@@ -105,6 +105,8 @@ SionnaSpectrumPropagationLossModel::DoCalcRxPowerSpectralDensity(Ptr<const Spect
     // add trailing 1 to have same size
     H_norm.emplace_back(1.0, 0.0);
 
+    // std::cout << "[DBG] psdN=" << params->psd->GetValuesN()
+    //       << " HN=" << H_norm.size() << std::endl;
     NS_ASSERT_MSG(H_norm.size() == params->psd->GetValuesN(), "PSD and CFR must have the same size");
 
     // apply small-scale fading
