@@ -9,6 +9,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <memory>
 
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
@@ -204,6 +205,9 @@ int main(int argc, char** argv) {
   std::string outPrefix="out";
   uint32_t seed=1;
 
+  double xMin = 0.0, xMax = 80.0;
+  double yMin = 0.0, yMax = 40.0;
+
   CommandLine cmd(__FILE__);
   cmd.AddValue("propModel", "sionna|friis", propModel);
   cmd.AddValue("environment", "env XML relative to server --model_folder", environment);
@@ -222,6 +226,11 @@ int main(int argc, char** argv) {
   cmd.AddValue("dumpFullCfr", "write full CFR vectors", dumpFullCfr);
   cmd.AddValue("dumpMaxPerLink", "max dumps per (src,dst)", dumpMaxPerLink);
   cmd.AddValue("outPrefix", "output prefix", outPrefix);
+  cmd.AddValue("xMin", "min x for random placement", xMin);
+  cmd.AddValue("xMax", "max x for random placement", xMax);
+  cmd.AddValue("yMin", "min y for random placement", yMin);
+  cmd.AddValue("yMax", "max y for random placement", yMax);
+
   cmd.Parse(argc, argv);
 
   RngSeedManager::SetSeed(seed);
@@ -248,7 +257,15 @@ int main(int argc, char** argv) {
     Ptr<UniformRandomVariable> ux = CreateObject<UniformRandomVariable>();
     Ptr<UniformRandomVariable> uy = CreateObject<UniformRandomVariable>();
     ux->SetStream(seed+100); uy->SetStream(seed+200);
-    for (uint32_t i=0;i<nSta;++i) staPos.emplace_back(ux->GetValue(0,80), uy->GetValue(0,40), 1.0);
+    apPos = Vector(10.0, 10.0, 1.5);
+    for (uint32_t i = 0; i < nSta; ++i)
+    {
+      staPos.emplace_back(
+        ux->GetValue(xMin, xMax),
+        uy->GetValue(yMin, yMax),
+        1.5
+      );
+    }
   }
 
   MobilityHelper mobAp; mobAp.SetMobilityModel("ns3::SionnaMobilityModel"); mobAp.Install(apNode);
@@ -270,11 +287,11 @@ int main(int argc, char** argv) {
 
   Ptr<MultiModelSpectrumChannel> spectrumChannel = CreateObject<MultiModelSpectrumChannel>();
 
-  Ptr<SionnaHelper> sionnaHelper;
+  std::unique_ptr<SionnaHelper> sionnaHelper;
   Ptr<SionnaPropagationCache> propCache;
 
   if (propModel == "sionna") {
-    sionnaHelper = CreateObject<SionnaHelper>(environment, kZmqEndpoint);
+    sionnaHelper = std::make_unique<SionnaHelper>(environment, kZmqEndpoint);
     propCache = CreateObject<SionnaPropagationCache>();
     propCache->SetSionnaHelper(*sionnaHelper);
     propCache->SetCaching(caching);
