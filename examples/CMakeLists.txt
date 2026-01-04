@@ -89,7 +89,7 @@ build_lib_example(
 )
 
 build_lib_example(
-        NAME ns3sionna-example-sionna-montecarlo
-        SOURCE_FILES example-sionna-montecarlo.cc
+        NAME ns3sionna-example-sionna-spectrum-compare
+        SOURCE_FILES example-sionna-spectrum-compare.cc
         LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
 )
