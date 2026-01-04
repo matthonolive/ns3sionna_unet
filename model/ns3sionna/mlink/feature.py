@@ -90,6 +90,9 @@ def binary_walls(scene: Scene, frequency: float) -> npt.NDArray[np.floating]:
                 ).astype(np.int32)
             )
 
+        if len(o) == 0:
+            return np.zeros((0, 3), dtype=np.int32)
+
         return np.concatenate(o, axis=0)
 
     wall_tensor_lst = []
