@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
   std::string outPrefix="out";
   uint32_t seed=1;
 
-  double xMin = 0.0, xMax = 80.0;
+  double xMin = 0.0, xMax = 40.0;
   double yMin = 0.0, yMax = 40.0;
 
   CommandLine cmd(__FILE__);
