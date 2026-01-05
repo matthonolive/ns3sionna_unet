@@ -1073,11 +1073,7 @@ class SionnaEnv:
         h_normalized_arr = []
 
         for rx_id, curr_rx_node in enumerate(rx_nodes):
-            lnk_tau = np.squeeze(tau[rx_id, :, :, :, :])
-            lnk_delay = int(round(np.min(lnk_tau[lnk_tau >= 0] * 1e9), 0))
-
-            ### Reciprocity stats ###
-
+            
             tx_pos = np.array(self.node_info[tx_node].pos, dtype=np.float64)
             rx_pos = np.array(self.node_info[curr_rx_node].pos, dtype=np.float64)
             d_m = float(np.linalg.norm(tx_pos - rx_pos))
@@ -1087,6 +1083,24 @@ class SionnaEnv:
             print(f"[FRIIS] tx={tx_node} rx={curr_rx_node} d={d_m:.3f} m fspl={friis_loss_db:.2f} dB")
 
             base_ns = d_m / 299792458.0 * 1e9
+
+
+            lnk_tau = np.squeeze(tau[rx_id, :, :, :, :])
+
+            valid = lnk_tau[np.isfinite(lnk_tau) & (lnk_tau >= 0)]
+
+            if valid.size == 0:
+                # No path found (common with --rt_fast in blocked scenes)
+                if self.VERBOSE:
+                    print(f"[RT] NO-PATH tx={tx_node} rx={curr_rx_node} d={d_m:.3f}m (rt_fast={self.rt_fast})")
+                lnk_delay_arr.append(int(round(base_ns)))  # or 0 if you prefer
+                lnk_loss_arr.append(float(self.unet_no_path_wb))  # 199.5 dB sentinel
+                h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
+                continue
+
+            lnk_delay = int(round(valid.min() * 1e9, 0))
+
+            ### Reciprocity stats ###
             ex_ns = float(max(0.0, lnk_delay - base_ns))
             a_link = np.squeeze(a[rx_id, :, :, :, :, :])
             tau_link = np.squeeze(tau[rx_id, :, :, :, :])
@@ -1106,6 +1120,12 @@ class SionnaEnv:
 
             # for frequency-selective channel
             power = np.mean(np.abs(h) ** 2)  # shape [batch_size, 1, 1, 1]
+
+            if (not np.isfinite(power)) or power <= 0:
+                lnk_delay_arr.append(int(round(base_ns)))
+                lnk_loss_arr.append(float(self.unet_no_path_wb))
+                h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
+                continue
 
             h_normalized = h / np.sqrt(power)
 
