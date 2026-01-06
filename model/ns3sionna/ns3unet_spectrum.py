@@ -236,11 +236,11 @@ class UNetTdlPropagator:
         pred = self._forward(x_t)  # (Y_model,H,W)
 
         # output reshape: expect Y_model == K*y_ch
-        y_ch = 3  # wb, excess, tau_rms
+        y_ch = 4  # wb, excess, tau_rms
         if self.Y_model != self.K * y_ch:
             raise RuntimeError(
                 f"UNet output channel mismatch: model outputs Y_model={self.Y_model}, expected K*y_ch={self.K*y_ch}. "
-                f"Either y_ch isn't 3 for this run, or the model isn't slice-stacked."
+                f"Either y_ch isn't 4 for this run, or the model isn't slice-stacked."
             )
 
         maps = pred.view(self.K, y_ch, self.H, self.W).detach().float().cpu().numpy()
@@ -981,7 +981,10 @@ class SionnaEnv:
             for curr_rx_node in rx_nodes:
                 rx_pos = np.array(self.node_info[curr_rx_node].pos, dtype=np.float32)
 
-                wb_db, tau_rms_ns, excess_ns = self._unet.sample_heads(rx_pos)
+                delta_db, tau_rms_ns, excess_ns = self._unet.sample_heads(rx_pos)
+                d_m = float(np.linalg.norm(tx_pos - rx_pos))
+                friis_loss_db = fspl_db(d_m, self.fc)
+                wb_db = friis_loss_db + float(delta_db)
 
                 # no-path guard
                 if wb_db >= (self.unet_no_path_wb - 1e-3):
@@ -990,11 +993,7 @@ class SionnaEnv:
                     h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
                     continue
 
-                # delay: d/c + excess
-                d_m = float(np.linalg.norm(tx_pos - rx_pos))
-
                 ##Friis for comparison###
-                friis_loss_db = fspl_db(d_m, self.fc)
                 print(f"[FRIIS] tx={tx_node} rx={curr_rx_node} d={d_m:.3f} m fspl={friis_loss_db:.2f} dB")
 
                 base_ns = d_m / 299792458.0 * 1e9
