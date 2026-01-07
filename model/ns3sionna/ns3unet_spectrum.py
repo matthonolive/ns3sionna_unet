@@ -1005,7 +1005,7 @@ class SionnaEnv:
 
                 # normalized CFR from G(tau_rms)
                 seed = (int(self.my_seed) * 1315423911) ^ (int(tx_node) * 2654435761) ^ (int(curr_rx_node) * 97531) ^ (int(self.sim_time) & 0xffffffff)
-                print(f"rx={curr_rx_node} wb={wb_db:.1f}dB")
+                print(f"Wideband loss: rx={curr_rx_node} wb={wb_db:.1f}dB")
 
                 #Testing physical laws
                 delay_ns = base_ns + ex
