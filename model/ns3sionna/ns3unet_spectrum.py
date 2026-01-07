@@ -152,11 +152,11 @@ class UNetTdlPropagator:
         else:
             self.fft_shift = False
 
-            # origin
-            if self.origin_xy_mode == "zero":
-                x0 = 0.0; y0 = 0.0
-            else:
-                x0 = float(bbox.min.x); y0 = float(bbox.min.y)
+        # origin
+        if self.origin_xy_mode == "zero":
+            x0 = 0.0; y0 = 0.0
+        else:
+            x0 = float(bbox.min.x); y0 = float(bbox.min.y)
 
         z_min = float(bbox.min.z); z_max = float(bbox.max.z)
         total_span = (self.K - 1) * self.z_step_m
