@@ -295,6 +295,7 @@ int main(int argc, char** argv) {
     propCache = CreateObject<SionnaPropagationCache>();
     propCache->SetSionnaHelper(*sionnaHelper);
     propCache->SetCaching(caching);
+    propCache->SetOptimize(false);
 
     auto loss = CreateObject<SionnaPropagationLossModel>();
     loss->SetPropagationCache(propCache);
