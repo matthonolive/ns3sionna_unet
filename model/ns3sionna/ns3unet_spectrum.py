@@ -594,8 +594,15 @@ class SionnaEnv:
 
 
         # place TX and RX nodes together with their future positions
-        rx_nodes = nodes_to_update
-        rx_nodes.remove(tx_node_id)
+        rx_nodes = [nid for nid in nodes_to_update if nid != tx_node_id]
+
+        
+        if self.use_unet:
+
+            return self._compute_cfr_with_lookahead_unet(lah_time_vec=lah_time_vec,
+                                                         tx_node_id=tx_node_id,
+                                                         rx_nodes=rx_nodes,
+                                                         reply_wrapper=reply_wrapper)
 
         self._place_tx_rx_nodes_with_lah(lah_time_vec, tx_node_id, rx_nodes)
 
@@ -705,6 +712,114 @@ class SionnaEnv:
         print(f'{self.sim_time / 1e9}s: Computed CSI with Tc: {np.round(np.asarray(Tc_p2mp_lah) / 1e6,2)}ms, #links: {num_computed_lnks}')
 
         return num_computed_lnks
+
+
+    def _compute_cfr_with_lookahead_unet(self, lah_time_vec: list, tx_node_id: int, rx_nodes: list, reply_wrapper):
+        """Compute LAH CSI using the UNet surrogate (no ray tracing).
+
+        Mirrors the response format of the RT-based LAH path:
+        - One CSI sample per time in `lah_time_vec`
+        - Each sample contains all RX nodes
+        - CFR is normalized (mean |H|^2 ~= 1) when `self.est_csi` is enabled
+        """
+
+        def fspl_db(d_m: float, fc_hz: float) -> float:
+            d_m = max(float(d_m), 1e-6)
+            lam = 299792458.0 / float(fc_hz)
+            return 20.0 * np.log10(4.0 * np.pi * d_m / lam)
+
+        # Precompute lists to avoid huge Python overhead in inner loops
+        freqs_list = self.frequencies.tolist()
+        zeros_f_list = np.zeros((self.fft_size,), dtype=np.float32).tolist()
+
+        # TX must be fixed in MODE_P2MP_LAH
+        tx_pos = np.array(self.node_info[tx_node_id].pos, dtype=np.float32)
+        self._unet.predict_for_tx(tx_pos)
+
+        chan_response = reply_wrapper.channel_state_response
+
+        Tc_p2mp_lah = []
+        num_links = 0
+
+        for lah_time in lah_time_vec:
+            csi = chan_response.csi.add()
+            csi.start_time = int(lah_time)
+
+            # TX info (fixed)
+            csi.tx_node.id = int(tx_node_id)
+            csi.tx_node.position.x = float(tx_pos[0])
+            csi.tx_node.position.y = float(tx_pos[1])
+            csi.tx_node.position.z = float(tx_pos[2])
+
+            csi_tc_arr = []
+            for curr_rx_node in rx_nodes:
+                rx_pos = np.array(self.node_info[curr_rx_node].get_pos_at(lah_time), dtype=np.float32)
+
+                delta_db, tau_rms_ns, excess_ns = self._unet.sample_heads(rx_pos)
+                d_m = float(np.linalg.norm(tx_pos - rx_pos))
+                friis_loss_db = fspl_db(d_m, self.fc)
+                wb_db = float(friis_loss_db + float(delta_db))
+
+                base_ns = d_m / 299792458.0 * 1e9
+                ex = 0.0 if excess_ns is None else float(max(0.0, excess_ns))
+                delay_ns = base_ns + ex
+
+                no_path = wb_db >= (self.unet_no_path_wb - 1e-3)
+
+                rx_node_info = csi.rx_nodes.add()
+                rx_node_info.id = int(curr_rx_node)
+                rx_node_info.position.x = float(rx_pos[0])
+                rx_node_info.position.y = float(rx_pos[1])
+                rx_node_info.position.z = float(rx_pos[2])
+
+                if no_path:
+                    rx_node_info.delay = 0
+                    rx_node_info.wb_loss = float(self.unet_no_path_wb)
+                    if self.est_csi:
+                        rx_node_info.frequencies.extend(freqs_list)
+                        rx_node_info.csi_imag.extend(zeros_f_list)
+                        rx_node_info.csi_real.extend(zeros_f_list)
+                else:
+                    rx_node_info.delay = int(round(delay_ns))
+                    rx_node_info.wb_loss = float(wb_db)
+
+                    if self.est_csi:
+                        seed = (
+                            (int(self.my_seed) * 1315423911)
+                            ^ (int(tx_node_id) * 2654435761)
+                            ^ (int(curr_rx_node) * 97531)
+                            ^ (int(lah_time) & 0xFFFFFFFF)
+                        )
+                        h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, seed=seed)
+
+                        if self.CHECKS_ENABLED:
+                            p = float(np.mean(np.abs(h_norm) ** 2))
+                            assert abs(p - 1.0) < 1e-2
+
+                        rx_node_info.frequencies.extend(freqs_list)
+                        rx_node_info.csi_imag.extend(np.imag(h_norm).tolist())
+                        rx_node_info.csi_real.extend(np.real(h_norm).tolist())
+
+                tc = coherence_from_velocities(
+                    self.node_info[curr_rx_node].get_velo_at(lah_time),
+                    self.node_info[tx_node_id].velocity,
+                    self.fc,
+                    pos_tx=self.node_info[curr_rx_node].get_pos_at(lah_time),
+                    pos_rx=self.node_info[tx_node_id].pos,
+                )
+                rx_node_info.end_time2 = int(csi.start_time + tc)
+                csi_tc_arr.append(tc)
+                num_links += 1
+
+            Tc_p2mp = int(np.min(np.asarray(csi_tc_arr)))
+            Tc_p2mp_lah.append(Tc_p2mp)
+            csi.end_time = int(csi.start_time + Tc_p2mp - 1)  # non-overlapping intervals
+
+        print(
+            f"{self.sim_time / 1e9}s: Computed CSI with Tc: "
+            f"{np.round(np.asarray(Tc_p2mp_lah) / 1e6, 2)}ms, #links: {num_links} (UNet-LAH)"
+        )
+        return num_links
 
 
     def _place_tx_rx_nodes_with_lah(self, lah_time_vec: list, tx_node: int, rx_nodes: list):
