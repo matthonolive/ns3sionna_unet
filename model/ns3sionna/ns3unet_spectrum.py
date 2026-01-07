@@ -524,7 +524,7 @@ class SionnaEnv:
                 csi_req.rx_node = tx_node_id
 
         # check if mode 3 can be used
-        if self.mode == SionnaEnv.MODE_P2MP_LAH and isinstance(self.node_info[tx_node_id], ConstantMobility):
+        if self.mode == SionnaEnv.MODE_P2MP_LAH and isinstance(self.node_info[csi_req.tx_node], ConstantMobility):
             # mode=3 is feasible if TX is fixed
             return self.compute_cfr_with_lookahead(csi_req, reply_wrapper)
         else:
