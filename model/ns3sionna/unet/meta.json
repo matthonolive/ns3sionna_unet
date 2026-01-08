@@ -1,5 +1,5 @@
 {
-  "total_samples": 2500,
+  "total_samples": 5000,
   "H": 64,
   "W": 64,
   "K": 4,
@@ -50,8 +50,8 @@
   "tau_log_eps_ns": 0.001,
   "tau_cap_ns": 50.0,
   "merged_from": [
-    "runs/hard_cases1",
-    "runs/hard_cases2"
+    "runs/delta_3072_Jan6_merged",
+    "runs/hard_cases3"
   ],
   "x_ch_total": 24,
   "y_ch_total": 16,
