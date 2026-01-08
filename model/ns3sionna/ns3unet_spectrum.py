@@ -49,6 +49,8 @@ from mlink.channel_tdl import RtCfg, subcarrier_frequencies_centered, compute_td
 # import mobility models
 from mobility import *
 
+from time import perf_counter
+
 class UNetTdlPropagator:
     def __init__(
         self,
@@ -236,7 +238,7 @@ class UNetTdlPropagator:
         pred = self._forward(x_t)  # (Y_model,H,W)
 
         # output reshape: expect Y_model == K*y_ch
-        y_ch = 4  # wb, excess, tau_rms
+        y_ch = 4  # delta, excess, tau_rms, wb
         if self.Y_model != self.K * y_ch:
             raise RuntimeError(
                 f"UNet output channel mismatch: model outputs Y_model={self.Y_model}, expected K*y_ch={self.K*y_ch}. "
@@ -395,6 +397,14 @@ class SionnaEnv:
         # all node which are currently placed on the scene
         self.placed_radio_node_names = []
 
+        self._tim = {
+            "rt":   {"n": 0, "t": 0.0},
+            "unet": {"n": 0, "t": 0.0},
+            "rt_lah":   {"n": 0, "t": 0.0},
+            "unet_lah": {"n": 0, "t": 0.0},
+        }
+        self._tim_print_every = 20
+
 
     def init_simulation_env(self, sim_init_msg):
         '''
@@ -511,6 +521,14 @@ class SionnaEnv:
 
         return True, "OK"
 
+
+    def _tim_add(self, key: str, dt_s: float):
+        d = self._tim[key]
+        d["n"] += 1
+        d["t"] += dt_s
+        if (d["n"] % self._tim_print_every) == 0:
+            avg_ms = 1e3 * d["t"] / max(1, d["n"])
+            print(f"[TIM] {key}: n={d['n']} avg={avg_ms:.2f} ms", flush=True)
 
     def compute_cfr(self, csi_req, reply_wrapper):
 
@@ -911,7 +929,7 @@ class SionnaEnv:
                                             self.node_info[tx_node_id].velocity, self.fc,
                                             pos_tx=self.node_info[comp_rx_node_id].pos,
                                             pos_rx=self.node_info[tx_node_id].pos)
-            rx_node_info.end_time2 = tc
+            rx_node_info.end_time2 = csi.start_time + tc
             csi_tc_arr.append(tc)
 
         # take the worst case Tc from all RX nodes
@@ -921,7 +939,7 @@ class SionnaEnv:
 
         csi.end_time = self.sim_time + Tc_p2mp
 
-        print(f"[DBG] fft_size={self.fft_size} len(freqs)={len(self.frequencies)} "f"len(csi_real)={len(rx_node_info.csi_real)}")
+        #print(f"[DBG] fft_size={self.fft_size} len(freqs)={len(self.frequencies)} "f"len(csi_real)={len(rx_node_info.csi_real)}")
         return len(rx_nodes)
 
 
@@ -1031,6 +1049,8 @@ class SionnaEnv:
             d_m = max(float(d_m), 1e-6)
             lam = 299792458.0 / float(fc_hz)
             return 20.0 * np.log10(4.0 * np.pi * d_m / lam)
+        
+        t_req0 = perf_counter()
 
         # execute mobility
         dt = req_sim_time - self.sim_time
@@ -1086,14 +1106,19 @@ class SionnaEnv:
             return math.sqrt(var) * 1e9  # in ns
 
         if self.use_unet:
+            t0 = perf_counter()
             tx_pos = np.array(self.node_info[tx_node].pos, dtype=np.float32)
+
+            t_pred0 = perf_counter()
             self._unet.predict_for_tx(tx_pos)
+            t_pred = perf_counter() - t_pred0
 
             lnk_delay_arr = []
             lnk_loss_arr = []
             h_normalized_arr = []
 
             for curr_rx_node in rx_nodes:
+
                 rx_pos = np.array(self.node_info[curr_rx_node].pos, dtype=np.float32)
 
                 delta_db, tau_rms_ns, excess_ns = self._unet.sample_heads(rx_pos)
@@ -1142,12 +1167,21 @@ class SionnaEnv:
 
                 h_normalized_arr.append(h_norm)
 
+            t_total = perf_counter() - t0
+            self._tim_add("unet", t_total)
+            print(f"[TIM] unet breakdown: predict_for_tx={1e3*t_pred:.2f} ms total={1e3*t_total:.2f} ms", flush=True)
+
             return rx_nodes, lnk_delay_arr, lnk_loss_arr, h_normalized_arr
 
+        t0 = perf_counter()
+
+        t_place0 = perf_counter()
         self._place_tx_rx_node(tx_node, rx_nodes)
+        t_place = perf_counter() - t_place0
 
         # create pathsolver; todo: check reuse
         p_solver  = PathSolver()
+        
 
         #Deterministic seed based on link and time if you feel so inclined 
 
@@ -1156,6 +1190,7 @@ class SionnaEnv:
         rt_seed = (int(self.my_seed) * 1315423911) ^ (a * 2654435761) ^ (b * 97531)
 
         # Compute propagation paths
+        t_paths0 = perf_counter()
         paths = p_solver(scene=self.scene,
                          max_depth=self.rt_max_depth,
                          samples_per_src=self.rt_samples_per_src,
@@ -1167,10 +1202,14 @@ class SionnaEnv:
                          diffraction=self.rt_diffraction,  # costly
                          edge_diffraction=self.rt_edge_diffraction,  # rays that bend around edges
                          diffraction_lit_region=self.rt_diffraction_lit_region) # higher physical accuracy
+        t_paths = perf_counter() - t_paths0
+
 
         # AZU: sampling_frequency is only used if num_time_steps > 1
         # a: shape [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths, num_time_steps],
+        t_cfr0 = perf_counter()
         a, tau = paths.cir(sampling_frequency=1e9, normalize_delays=False, out_type="numpy")
+        t_cfr = perf_counter() - t_cfr0
 
         # shape: [num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_subcarriers]
         h_raw = paths.cfr(frequencies=self.frequencies,
@@ -1255,6 +1294,13 @@ class SionnaEnv:
             lnk_loss_arr.append(lnk_loss)
             h_normalized_arr.append(h_normalized)
 
+        t_total = perf_counter() - t0
+
+        self._tim_add("rt", t_total)
+        print(f"[TIM] rt breakdown: place={1e3*t_place:.2f} ms "
+            f"paths={1e3*t_paths:.2f} ms cir={1e3*t_cfr:.2f} ms cfr={1e3*t_cfr:.2f} ms "
+            f"total={1e3*t_total:.2f} ms", flush=True)
+
         return rx_nodes, lnk_delay_arr, lnk_loss_arr, h_normalized_arr
 
 
@@ -1333,7 +1379,9 @@ class SionnaEnv:
         do_terminate = False
         while not do_terminate:
             # Receive message from ns3 simulator
+            #t0 = time.time()
             ns3_msg_str = socket.recv()
+            #print(f"[ZMQ] recv after {time.time()-t0:.3f}s", flush=True)
 
             # Deserialize received message
             ns3_msg = message_pb2.Wrapper()
@@ -1375,13 +1423,21 @@ class SionnaEnv:
                         GPUtil.showUtilization()
 
             elif ns3_msg.HasField("sim_close_request"):
+                #print("[ZMQ] got sim_close_request", flush=True)
                 do_terminate = True
                 resp_msg.sim_ack.SetInParent()
 
             # Serialize and send the reply message
+            #t_send = time.time()
             socket.send(resp_msg.SerializeToString())
+            #print(f"[ZMQ] sent reply in {time.time()-t_send:.3f}s", flush=True)
+            #payload = resp_msg.SerializeToString()
+            #print(f"[ZMQ] send size={len(payload)/1e6:.2f} MB", flush=True)
 
+        print("[ZMQ] closing socket...", flush=True)
+        t_close = time.time()
         socket.close()
+        print(f"[ZMQ] socket closed in {time.time()-t_close:.3f}s", flush=True)
         print("Computed no. CSI samples: %d" % total_num_csi_samples)
         print("Sionna server socket closed.")
 
