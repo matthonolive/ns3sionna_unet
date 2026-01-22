@@ -50,8 +50,8 @@
   "tau_log_eps_ns": 0.001,
   "tau_cap_ns": 50.0,
   "merged_from": [
-    "runs/delta_3072_Jan6_merged",
-    "runs/hard_cases3"
+    "runs/delta_3072_Jan19_diff",
+    "runs/delta_3072_Jan20_diff"
   ],
   "x_ch_total": 24,
   "y_ch_total": 16,
