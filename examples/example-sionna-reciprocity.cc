@@ -11,6 +11,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <fstream>
 
 // Sionna models
 #include "ns3/sionna-helper.h"
@@ -122,6 +123,7 @@ main(int argc, char *argv[])
     uint32_t pktSize = 1024;
     uint16_t portA = 9000; // Node0 server
     uint16_t portB = 9001; // Node1 server
+    std::string dumpPlacements = ""; // if non-empty, write placements CSV
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("verbose", "Enable logging", verbose);
@@ -135,6 +137,7 @@ main(int argc, char *argv[])
     cmd.AddValue("maxPackets", "Max packets per client", maxPackets);
     cmd.AddValue("interval", "Client interval (s)", interval_s);
     cmd.AddValue("packetSize", "UDP packet size (B)", pktSize);
+    cmd.AddValue("dumpPlacements", "CSV path to dump node placements", dumpPlacements);
     cmd.Parse(argc, argv);
 
     if (verbose)
@@ -225,7 +228,34 @@ main(int argc, char *argv[])
 
     // Positions (edit as you like)
     apNode.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(1.0, 2.0, 1.0));   // Node0 (AP)
-    staNode.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(5.0, 2.0, 1.0));  // Node1 (STA)
+    staNode.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(32.0, 2.0, 1.0));  // Node1 (STA)
+
+    // --- Dump placements to CSV (optional) ---
+    if (!dumpPlacements.empty())
+    {
+        std::ofstream f(dumpPlacements);
+        if (!f.is_open())
+        {
+            NS_LOG_UNCOND("ERROR: could not open dumpPlacements file: " << dumpPlacements);
+        }
+        else
+        {
+            // First line stores the environment XML so the plotting script can auto-load it
+            f << "environment," << environment << "\n";
+            f << "role,nodeId,x,y,z\n";
+
+            auto writeOne = [&](const std::string& role, Ptr<Node> n)
+            {
+                Vector p = n->GetObject<MobilityModel>()->GetPosition();
+                f << role << "," << n->GetId() << ","
+                << p.x << "," << p.y << "," << p.z << "\n";
+            };
+
+            writeOne("AP", apNode.Get(0));
+            writeOne("STA", staNode.Get(0));
+        }
+    }
+
 
     // --- Internet stack ---
     InternetStackHelper stack;

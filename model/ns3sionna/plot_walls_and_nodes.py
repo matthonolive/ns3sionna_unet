@@ -10,18 +10,73 @@ from sionna.rt import load_scene
 from mlink.scene import Scene as MlinkScene
 from mlink.antenna import AntennaGrid, AntennaDatabase
 from mlink.feature import build_feature_tensor
+import csv
+
+
+import csv
+from pathlib import Path
+import numpy as np
 
 def load_placements(path):
-    tx=None; stas=[]
-    for line in Path(path).read_text().splitlines():
-        line=line.strip()
-        if not line or line.startswith("#"): continue
-        tag,xs,ys,zs = [x.strip() for x in line.split(",")[:4]]
-        x,y,z = float(xs),float(ys),float(zs)
-        if tag in ("tx","ap"): tx=np.array([x,y,z],np.float32)
-        if tag in ("sta","rx"): stas.append([x,y,z])
-    if tx is None or not stas: raise RuntimeError("placements missing tx or sta")
-    return tx, np.asarray(stas,np.float32)
+    p = Path(path)
+
+    # First try: CSV with header role,nodeId,x,y,z (and optional first line: environment,<xml>)
+    try:
+        rows = []
+        with p.open("r", newline="") as f:
+            reader = csv.reader(f)
+            for r in reader:
+                if not r or not any(c.strip() for c in r):
+                    continue
+                rows.append([c.strip() for c in r])
+
+        # Optional environment line
+        if rows and rows[0][0].lower() == "environment":
+            rows = rows[1:]
+
+        # Find header row
+        header_idx = None
+        for i, r in enumerate(rows):
+            if [c.lower() for c in r] == ["role", "nodeid", "x", "y", "z"]:
+                header_idx = i
+                break
+
+        if header_idx is not None:
+            tx = None
+            stas = []
+            for r in rows[header_idx+1:]:
+                if len(r) < 5:
+                    continue
+                role = r[0].lower()
+                x, y, z = float(r[2]), float(r[3]), float(r[4])
+                if role in ("ap", "tx"):
+                    tx = np.array([x, y, z], np.float32)
+                elif role in ("sta", "rx"):
+                    stas.append([x, y, z])
+            if tx is None or not stas:
+                raise RuntimeError("placements missing AP/TX or STA/RX rows")
+            return tx, np.asarray(stas, np.float32)
+    except Exception:
+        pass  # fall back to simple line format below
+
+    # Fallback: your original simple "tag,x,y,z" per line format
+    tx = None
+    stas = []
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        tag, xs, ys, zs = [x.strip() for x in line.split(",")[:4]]
+        x, y, z = float(xs), float(ys), float(zs)
+        tag = tag.lower()
+        if tag in ("tx", "ap"):
+            tx = np.array([x, y, z], np.float32)
+        elif tag in ("sta", "rx"):
+            stas.append([x, y, z])
+
+    if tx is None or not stas:
+        raise RuntimeError("placements missing tx or sta")
+    return tx, np.asarray(stas, np.float32)
 
 def main():
     ap = argparse.ArgumentParser()

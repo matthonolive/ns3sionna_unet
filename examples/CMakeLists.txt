@@ -93,3 +93,15 @@ build_lib_example(
         SOURCE_FILES example-sionna-spectrum-compare.cc
         LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
 )
+
+build_lib_example(
+        NAME ns3sionna-example-sionna-reciprocity-matrix
+        SOURCE_FILES example-sionna-reciprocity-matrix.cc
+        LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
+)
+
+build_lib_example(
+        NAME ns3sionna-example-sionna-flowmatrix
+        SOURCE_FILES example-sionna-flowmatrix.cc
+        LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
+)
