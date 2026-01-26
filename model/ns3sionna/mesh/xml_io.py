@@ -23,7 +23,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import trimesh
 import xml.etree.ElementTree as ET
-
+from typing import Union
 
 # ----------------------------
 # Material specs
@@ -51,6 +51,26 @@ class ItuRadioMaterialSpec:
     thickness: float = 0.10
     scattering_coefficient: float = 0.0
     xpd_coefficient: float = 0.0
+
+@dataclass(frozen=True)
+class RadioMaterialSpec:
+    """
+    Constant radio material (Sionna 'radio-material' BSDF).
+
+
+    XML corresponds to properties used by Sionna's RadioMaterial:
+    relative_permittivity, conductivity, thickness,
+    scattering_coefficient, xpd_coefficient
+    """
+    bsdf_id: str
+    relative_permittivity: float = 4.0
+    conductivity: float = 0.01
+    thickness: float = 0.10
+    scattering_coefficient: float = 0.0
+    xpd_coefficient: float = 0.0
+
+
+MaterialSpec = Union[ItuRadioMaterialSpec, RadioMaterialSpec]
 
 
 # ----------------------------
@@ -145,6 +165,14 @@ def _add_itu_bsdf(scene_el: ET.Element, mat: ItuRadioMaterialSpec) -> None:
     ET.SubElement(bsdf, "float", attrib={"name": "scattering_coefficient", "value": f"{float(mat.scattering_coefficient):.6g}"})
     ET.SubElement(bsdf, "float", attrib={"name": "xpd_coefficient", "value": f"{float(mat.xpd_coefficient):.6g}"})
 
+def _add_radio_bsdf(scene_el: ET.Element, mat: RadioMaterialSpec) -> None:
+    bsdf = ET.SubElement(scene_el, "bsdf", attrib={"type": "radio-material", "id": mat.bsdf_id})
+    ET.SubElement(bsdf, "float", attrib={"name": "relative_permittivity", "value": f"{float(mat.relative_permittivity):.6g}"})
+    ET.SubElement(bsdf, "float", attrib={"name": "conductivity", "value": f"{float(mat.conductivity):.6g}"})
+    ET.SubElement(bsdf, "float", attrib={"name": "thickness", "value": f"{float(mat.thickness):.6g}"})
+    ET.SubElement(bsdf, "float", attrib={"name": "scattering_coefficient", "value": f"{float(mat.scattering_coefficient):.6g}"})
+    ET.SubElement(bsdf, "float", attrib={"name": "xpd_coefficient", "value": f"{float(mat.xpd_coefficient):.6g}"})
+
 
 def _add_obj_shape(scene_el: ET.Element, obj_relpath: str, bsdf_id: str, shape_id: Optional[str] = None) -> None:
     attrib = {"type": "obj"}
@@ -161,7 +189,7 @@ def export_scene_xml_from_parts(
     xml_name: str = "scene.xml",
     meshes_subdir: str = "meshes",
     parts: Dict[str, trimesh.Trimesh],
-    materials: Dict[str, ItuRadioMaterialSpec],
+    materials: Dict[str, MaterialSpec],
 ) -> Path:
     """
     Export a Sionna-loadable Mitsuba XML scene from explicit mesh parts.
@@ -194,9 +222,18 @@ def export_scene_xml_from_parts(
     for key, mat in materials.items():
         if mat.bsdf_id in seen:
             continue
-        _add_itu_bsdf(scene_el, mat)
+
+
+        if isinstance(mat, ItuRadioMaterialSpec):
+            _add_itu_bsdf(scene_el, mat)
+        elif isinstance(mat, RadioMaterialSpec):
+            _add_radio_bsdf(scene_el, mat)
+        else:
+            raise TypeError(f"Unknown material spec type: {type(mat)}")
+
         seen.add(mat.bsdf_id)
 
+        
     # --- Shapes (write OBJs and reference them) ---
     for part_name, mesh in parts.items():
         if part_name not in materials:
@@ -213,6 +250,7 @@ def export_scene_xml_from_parts(
     xml_path = out_dir / xml_name
     ET.ElementTree(scene_el).write(xml_path, encoding="utf-8", xml_declaration=True)
     return xml_path
+
 
 
 def export_walls_floor_ceiling_xml(

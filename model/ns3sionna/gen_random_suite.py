@@ -9,7 +9,7 @@ import numpy as np
 import trimesh
 
 from mlink.geometry import generate_wall_map, walls_to_mesh
-from mesh.xml_io import ItuRadioMaterialSpec, export_walls_floor_ceiling_xml
+from mesh.xml_io import ItuRadioMaterialSpec, RadioMaterialSpec, export_walls_floor_ceiling_xml
 
 
 def make_double_sided(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -231,13 +231,23 @@ def main():
     # Bookkeeping (doesn't affect geometry)
     ap.add_argument("--frequency_hz", type=float, default=2e9)
 
-    # Materials (explicit, named, consistent)
+    # Materials
+    ap.add_argument("--material_mode", choices=["radio", "itu"], default="radio",
+    help="radio = constant 'radio-material' (match training_tdl); itu = ITU material types")
+
+    # Constant radio-material params (match training_tdl defaults)
+    ap.add_argument("--eps_r", type=float, default=4.0)
+    ap.add_argument("--sigma_s_m", type=float, default=0.01)
+    ap.add_argument("--thickness_m", type=float, default=0.10)
+
+    # Optional ITU params (only used if --material_mode=itu)
     ap.add_argument("--wall_itu", type=str, default="brick")
     ap.add_argument("--floor_itu", type=str, default="concrete")
     ap.add_argument("--ceiling_itu", type=str, default="concrete")
     ap.add_argument("--wall_thickness_m", type=float, default=0.10)
     ap.add_argument("--floor_thickness_m", type=float, default=0.15)
     ap.add_argument("--ceiling_thickness_m", type=float, default=0.10)
+
 
     #Adversarial Friis placements
     ap.add_argument("--friis_adversarial", action="store_true",
@@ -273,11 +283,23 @@ def main():
             "ceil_max_units": args.ceil_max_units,
         },
         "frequency_hz": args.frequency_hz,
-        "materials": {
-            "walls": {"itu": args.wall_itu, "thickness_m": args.wall_thickness_m},
-            "floor": {"itu": args.floor_itu, "thickness_m": args.floor_thickness_m},
-            "ceiling": {"itu": args.ceiling_itu, "thickness_m": args.ceiling_thickness_m},
-        },
+        "materials": (
+            {
+                "mode": "radio",
+                "radio": {
+                    "eps_r": args.eps_r,
+                    "sigma_s_m": args.sigma_s_m,
+                    "thickness_m": args.thickness_m,
+                },
+            }
+            if args.material_mode == "radio"
+            else {
+                "mode": "itu",
+                "walls": {"itu": args.wall_itu, "thickness_m": args.wall_thickness_m},
+                "floor": {"itu": args.floor_itu, "thickness_m": args.floor_thickness_m},
+                "ceiling": {"itu": args.ceiling_itu, "thickness_m": args.ceiling_thickness_m},
+            }
+        ),
         "double_sided": bool(args.double_sided),
     }
     (out_root / "suite_manifest.json").write_text(json.dumps(suite_manifest, indent=2))
@@ -319,23 +341,34 @@ def main():
         # Save the occupancy grid
         np.save(scene_dir / "walls_2d.npy", walls_2d)
 
-        # Materials: explicit IDs + explicit ITU type
-        wall_mat = ItuRadioMaterialSpec(
-            bsdf_id=f"mat-itu_{args.wall_itu}",
-            itu_type=args.wall_itu,
-            thickness=float(args.wall_thickness_m),
-        )
-        floor_mat = ItuRadioMaterialSpec(
-            bsdf_id=f"mat-itu_{args.floor_itu}",
-            itu_type=args.floor_itu,
-            thickness=float(args.floor_thickness_m),
-        )
-        ceil_mat = ItuRadioMaterialSpec(
-            bsdf_id=f"mat-itu_{args.ceiling_itu}",
-            itu_type=args.ceiling_itu,
-            thickness=float(args.ceiling_thickness_m),
-        )
-
+# Materials
+        if args.material_mode == "radio":
+            # Match training_tdl.py: one uniform material everywhere
+            wall_mat = RadioMaterialSpec(
+                bsdf_id="mat-radio_uniform",
+                relative_permittivity=float(args.eps_r),
+                conductivity=float(args.sigma_s_m),
+                thickness=float(args.thickness_m),
+            )
+            floor_mat = wall_mat
+            ceil_mat = wall_mat
+        else:
+            # ITU materials (old behavior)
+            wall_mat = ItuRadioMaterialSpec(
+                bsdf_id=f"mat-itu_{args.wall_itu}",
+                itu_type=args.wall_itu,
+                thickness=float(args.wall_thickness_m),
+            )
+            floor_mat = ItuRadioMaterialSpec(
+                bsdf_id=f"mat-itu_{args.floor_itu}",
+                itu_type=args.floor_itu,
+                thickness=float(args.floor_thickness_m),
+            )
+            ceil_mat = ItuRadioMaterialSpec(
+                bsdf_id=f"mat-itu_{args.ceiling_itu}",
+                itu_type=args.ceiling_itu,
+                thickness=float(args.ceiling_thickness_m),
+            )
         # Export XML+OBJs (splits by min-z/max-z planes internally)
         xml_path = export_walls_floor_ceiling_xml(
             mesh_m,
@@ -394,6 +427,7 @@ def main():
         scene_info = {
             "seed": seed,
             "xml": str(xml_path.name),
+            "material_mode": args.material_mode,
             "materials": {
                 "walls": wall_mat.__dict__,
                 "floor": floor_mat.__dict__,
