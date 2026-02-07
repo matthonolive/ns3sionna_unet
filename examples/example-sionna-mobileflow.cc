@@ -357,6 +357,173 @@ AppendTimingCsv(const std::string& timingCsv,
     f.close();
 }
 
+//Logging class for purpose of getting CDF
+class NodeTimeseriesLogger : public Object
+{
+public:
+    struct Snap
+    {
+        uint64_t txPackets = 0, rxPackets = 0, lostPackets = 0;
+        uint64_t txBytes = 0, rxBytes = 0;
+        double delaySum_s = 0.0;
+        double jitterSum_s = 0.0;
+    };
+
+    void Setup(Ptr<FlowMonitor> mon,
+               FlowMonitorHelper* helper,
+               const std::unordered_map<uint32_t, uint32_t>& ipToIndex,
+               const std::vector<std::string>& labels,
+               const NodeContainer& nodes,
+               uint16_t portMin,
+               uint16_t portMax,
+               Time period,
+               Time stopTime,
+               const std::string& outCsv)
+    {
+        m_mon = mon;
+        m_helper = helper;
+        m_ipToIndex = ipToIndex;
+        m_labels = labels;
+        m_nodes = nodes;
+        m_portMin = portMin;
+        m_portMax = portMax;
+        m_period = period;
+        m_stop = stopTime;
+
+        m_classifier = DynamicCast<Ipv4FlowClassifier>(m_helper->GetClassifier());
+
+        m_f.open(outCsv, std::ios::out);
+        NS_ABORT_MSG_IF(!m_f.is_open(), "Could not open node timeseries CSV: " << outCsv);
+
+        m_f << "t_s,node,label,x,y,z,"
+               "win_txPkts,win_rxPkts,win_lostPkts,win_rxBytes,"
+               "throughput_Mbps,lossRate,"
+               "meanDelay_ms,meanJitter_ms,active\n";
+    }
+
+    void Sample()
+    {
+        Time now = Simulator::Now();
+        if (now > m_stop)
+        {
+            m_f.close();
+            return;
+        }
+
+        m_mon->CheckForLostPackets();
+        auto stats = m_mon->GetFlowStats();
+
+        const double dt_s = m_period.GetSeconds();
+        const uint32_t N = m_nodes.GetN();
+
+        struct Agg
+        {
+            uint64_t txPkts=0, rxPkts=0, lostPkts=0, rxBytes=0;
+            double delaySum_s=0.0, jitterSum_s=0.0;
+            uint64_t rxForDelay=0, rxForJitter=0;
+        };
+        std::vector<Agg> perNode(N);
+
+        for (const auto& kv : stats)
+        {
+            FlowId fid = kv.first;
+            const FlowMonitor::FlowStats& st = kv.second;
+            auto t = m_classifier->FindFlow(fid);
+
+            if (t.destinationPort < m_portMin || t.destinationPort > m_portMax)
+                continue;
+
+            auto itS = m_ipToIndex.find(t.sourceAddress.Get());
+            auto itD = m_ipToIndex.find(t.destinationAddress.Get());
+            if (itS == m_ipToIndex.end() || itD == m_ipToIndex.end())
+                continue;
+
+            uint32_t j = itD->second; // aggregate at receiver node
+
+            Snap cur;
+            cur.txPackets = st.txPackets;
+            cur.rxPackets = st.rxPackets;
+            cur.lostPackets = st.lostPackets;
+            cur.txBytes = st.txBytes;
+            cur.rxBytes = st.rxBytes;
+            cur.delaySum_s = st.delaySum.GetSeconds();
+            cur.jitterSum_s = st.jitterSum.GetSeconds();
+
+            Snap prev = m_last[fid]; // default 0s if new
+
+            // window deltas
+            uint64_t dTxPkts = cur.txPackets - prev.txPackets;
+            uint64_t dRxPkts = cur.rxPackets - prev.rxPackets;
+            uint64_t dLost  = cur.lostPackets - prev.lostPackets;
+            uint64_t dRxB   = cur.rxBytes - prev.rxBytes;
+            double dDelay   = cur.delaySum_s - prev.delaySum_s;
+            double dJitter  = cur.jitterSum_s - prev.jitterSum_s;
+
+            m_last[fid] = cur;
+
+            auto& a = perNode[j];
+            a.txPkts += dTxPkts;
+            a.rxPkts += dRxPkts;
+            a.lostPkts += dLost;
+            a.rxBytes += dRxB;
+
+            if (dRxPkts > 0)
+            {
+                a.delaySum_s += dDelay;
+                a.rxForDelay += dRxPkts;
+            }
+            if (dRxPkts > 1)
+            {
+                a.jitterSum_s += dJitter;
+                a.rxForJitter += (dRxPkts - 1);
+            }
+        }
+
+        double t_s = now.GetSeconds();
+        for (uint32_t n = 0; n < N; ++n)
+        {
+            Vector p = m_nodes.Get(n)->GetObject<MobilityModel>()->GetPosition();
+            const auto& a = perNode[n];
+
+            double thr_Mbps = (dt_s > 0.0) ? (a.rxBytes * 8.0 / dt_s / 1e6) : 0.0;
+            double lossRate = (a.txPkts > 0) ? (double(a.lostPkts) / double(a.txPkts)) : 0.0;
+
+            double meanDelay_ms = (a.rxForDelay > 0) ? (a.delaySum_s / a.rxForDelay * 1e3) : 0.0;
+            double meanJitter_ms = (a.rxForJitter > 0) ? (a.jitterSum_s / a.rxForJitter * 1e3) : 0.0;
+
+            int active = (a.rxPkts > 0) ? 1 : 0;
+
+            m_f << std::fixed << std::setprecision(6)
+                << t_s << "," << n << "," << m_labels[n] << ","
+                << p.x << "," << p.y << "," << p.z << ","
+                << a.txPkts << "," << a.rxPkts << "," << a.lostPkts << "," << a.rxBytes << ","
+                << thr_Mbps << "," << lossRate << ","
+                << meanDelay_ms << "," << meanJitter_ms << "," << active << "\n";
+        }
+
+        Simulator::Schedule(m_period, &NodeTimeseriesLogger::Sample, this);
+    }
+
+private:
+    Ptr<FlowMonitor> m_mon;
+    FlowMonitorHelper* m_helper = nullptr;
+    Ptr<Ipv4FlowClassifier> m_classifier;
+
+    std::unordered_map<uint32_t, uint32_t> m_ipToIndex;
+    std::vector<std::string> m_labels;
+    NodeContainer m_nodes;
+
+    uint16_t m_portMin = 0, m_portMax = 0;
+    Time m_period;
+    Time m_stop;
+
+    std::unordered_map<FlowId, Snap> m_last;
+    std::ofstream m_f;
+};
+
+
+
+
 int
 main(int argc, char* argv[])
 {
@@ -386,6 +553,19 @@ main(int argc, char* argv[])
     double appRateMbps = 0.1;
     double stagger = 0.01;
     uint16_t basePort = 9000;
+
+    // Mobility
+    bool enableMobility = true;     // enable RandomWalk for STAs
+    bool mobileTx = false;          // keep TX fixed by default
+    std::string mobMode = "wall";   // wall|time|distance
+    double mobSpeedMin = 0.2;       // m/s
+    double mobSpeedMax = 1.0;       // m/s
+    double mobTime_s = 0.5;         // if mobMode=time
+    double mobDist_m = 0.5;         // if mobMode=distance
+
+    // Logging for mobility
+    std::string outNodeTsCsv = "node_timeseries.csv";
+    double samplePeriod = 0.1;
 
     // Outputs
     std::string outFlowCsv = "flow_stats.csv";
@@ -418,6 +598,17 @@ main(int argc, char* argv[])
     cmd.AddValue("basePort", "Base UDP port", basePort);
     cmd.AddValue("outFlowCsv", "Output per-flow CSV", outFlowCsv);
     cmd.AddValue("outPairCsv", "Output per-pair CSV", outPairCsv);
+    // Mobility cmds
+    cmd.AddValue("enableMobility", "Enable RandomWalk mobility (sionna mobility model)", enableMobility);
+    cmd.AddValue("mobileTx", "If 1, TX also moves (may disable some sionna modes)", mobileTx);
+    cmd.AddValue("mobMode", "RandomWalk direction-change mode: wall|time|distance", mobMode);
+    cmd.AddValue("mobSpeedMin", "RandomWalk speed min (m/s)", mobSpeedMin);
+    cmd.AddValue("mobSpeedMax", "RandomWalk speed max (m/s)", mobSpeedMax);
+    cmd.AddValue("mobTime", "RandomWalk direction-change time (s) if mode=time", mobTime_s);
+    cmd.AddValue("mobDistance", "RandomWalk direction-change distance (m) if mode=distance", mobDist_m);
+    cmd.AddValue("outNodeTsCsv", "Per-node windowed timeseries CSV", outNodeTsCsv);
+    cmd.AddValue("samplePeriod", "Window size for timeseries sampling (s)", samplePeriod);
+
 
     cmd.AddValue("timingCsv", "Append timing summary row to this CSV", timingCsv);
     cmd.AddValue("benchLinks", "Benchmark propagation calls over all ordered pairs (0/1)", benchLinks);
@@ -554,6 +745,56 @@ main(int argc, char* argv[])
     for (uint32_t k = 0; k < staPos.size(); ++k)
         nodes.Get(1 + k)->GetObject<MobilityModel>()->SetPosition(staPos[k]);
 
+    
+    auto SetRandomWalk = [&](Ptr<Node> node)
+    {
+        Ptr<MobilityModel> mm = node->GetObject<MobilityModel>();
+
+        // Switch from default "Constant Position" to "Random Walk"
+        mm->SetAttribute("Model", StringValue("Random Walk"));
+
+        // Direction-change trigger
+        std::string m = mobMode;
+        for (auto& c : m) c = std::tolower(static_cast<unsigned char>(c));
+
+        if (m == "wall")
+        {
+            mm->SetAttribute("Mode", StringValue("Wall"));
+            mm->SetAttribute("Wall", BooleanValue(true));
+        }
+        else if (m == "time")
+        {
+            mm->SetAttribute("Mode", StringValue("Time"));
+            mm->SetAttribute("Time", TimeValue(Seconds(mobTime_s)));
+        }
+        else if (m == "distance")
+        {
+            mm->SetAttribute("Mode", StringValue("Distance"));
+            mm->SetAttribute("Distance", DoubleValue(mobDist_m));
+        }
+        else
+        {
+            NS_ABORT_MSG("mobMode must be wall|time|distance");
+        }
+
+        // Speed + direction distributions
+        std::ostringstream sp;
+        sp << "ns3::UniformRandomVariable[Min=" << mobSpeedMin << "|Max=" << mobSpeedMax << "]";
+        mm->SetAttribute("Speed", StringValue(sp.str()));
+
+        // radians in [0, 2pi)
+        mm->SetAttribute("Direction",
+                        StringValue("ns3::UniformRandomVariable[Min=0|Max=6.283185307179586]"));
+    };
+
+    if (useSionna && enableMobility)
+    {
+        if (mobileTx) SetRandomWalk(nodes.Get(0));
+        for (uint32_t k = 0; k < staPos.size(); ++k)
+            SetRandomWalk(nodes.Get(1 + k));
+    }
+
+
     // Internet stack + IPs
     InternetStackHelper stack;
     stack.Install(nodes);
@@ -659,6 +900,16 @@ main(int argc, char* argv[])
 
         // FlowMonitor
         monitor = flowmonHelper.InstallAll();
+
+        Ptr<NodeTimeseriesLogger> ts = CreateObject<NodeTimeseriesLogger>();
+        ts->Setup(monitor, &flowmonHelper, ipToIndex, labels, nodes,
+                portMin, portMax,
+                Seconds(samplePeriod),
+                Seconds(simTime),
+                outNodeTsCsv);
+
+        // start sampling when traffic starts (or at 0.0 if you prefer)
+        Simulator::Schedule(Seconds(trafficStart), &NodeTimeseriesLogger::Sample, ts);
 
         Simulator::Stop(Seconds(simTime));
 
