@@ -325,7 +325,6 @@ def _read_mobility_trace_csv(path: str):
     Uses piecewise-linear interpolation; velocity is segment slope.
     """
     with open(path, "r", newline="") as f:
-        # skip comments/blank lines until header
         while True:
             hdr_line = f.readline()
             if hdr_line == "":
@@ -342,66 +341,55 @@ def _read_mobility_trace_csv(path: str):
                 raise RuntimeError(f"mobility trace '{path}' missing column '{name}' (have {header})")
             return col[name]
 
-        it_t = need("t_s")
-        it_n = need("node")
-        it_x = need("x")
-        it_y = need("y")
-        it_z = need("z")
+        it_t = need("t_s"); it_n = need("node")
+        it_x = need("x");   it_y = need("y"); it_z = need("z")
 
-        # continue reading from current position with csv.reader
         reader = csv.reader(f)
-        raw = {}  # node -> list of (t_ns, (x,y,z))
+        raw = {}  # node -> list of (t_ns, pos)
         for row in reader:
             if not row:
                 continue
             if row[0].strip().startswith("#"):
                 continue
-            # tolerate extra columns
             if len(row) <= max(it_t, it_n, it_x, it_y, it_z):
                 continue
 
             t_s = float(row[it_t].strip())
-            n = int(float(row[it_n].strip()))
-            x = float(row[it_x].strip())
-            y = float(row[it_y].strip())
-            z = float(row[it_z].strip())
+            n   = int(float(row[it_n].strip()))
+            x   = float(row[it_x].strip())
+            y   = float(row[it_y].strip())
+            z   = float(row[it_z].strip())
 
             t_ns = int(round(t_s * 1e9))
             raw.setdefault(n, []).append((t_ns, np.array([x, y, z], dtype=np.float32)))
 
     trace = {}
     for n, items in raw.items():
-        # sort, de-dup by time
         items.sort(key=lambda p: p[0])
-        t_ns = []
-        pos = []
-        last = None
+
+        # de-dup by time
+        t_list = []
+        p_list = []
+        last_t = None
         for t, p in items:
-            if last is not None and t == last:
+            if last_t is not None and t == last_t:
                 continue
-            t_ns.append(t)
-            pos.append(p)
-            last = t
+            t_list.append(t)
+            p_list.append(p)
+            last_t = t
 
-        t_ns = np.asarray(t_ns, dtype=np.int64)
-        pos = np.asarray(pos, dtype=np.float32)
+        t_ns = np.asarray(t_list, dtype=np.int64)
+        pos  = np.asarray(p_list, dtype=np.float32)
 
-        # velocities: piecewise slopes
         vel = np.zeros_like(pos, dtype=np.float32)
         if len(t_ns) >= 2:
             dt = (t_ns[1:] - t_ns[:-1]).astype(np.float64) / 1e9
             dt = np.maximum(dt, 1e-12)
+            seg_v = ((pos[1:] - pos[:-1]) / dt[:, None]).astype(np.float32, copy=False)
 
-            seg_v = (pos[1:] - pos[:-1]) / dt[:, None]  # (N-1,3) float
-            seg_v = seg_v.astype(np.float32, copy=False)
-
-            # --- FIX: avoid zero-velocity segments causing huge coherence times ---
-            # Threshold (m/s) below which we treat velocity as "effectively zero"
+            # --- your existing "avoid zero-velocity segments" fix ---
             v_eps = 1e-3
-
-            speed = np.linalg.norm(seg_v, axis=1)  # (N-1,)
-
-            # 1) forward-fill zeros using last nonzero velocity
+            speed = np.linalg.norm(seg_v, axis=1)
             last = None
             for i in range(seg_v.shape[0]):
                 if speed[i] < v_eps:
@@ -410,20 +398,25 @@ def _read_mobility_trace_csv(path: str):
                 else:
                     last = seg_v[i].copy()
 
-            # 2) back-fill leading zeros using first nonzero velocity (if any)
             speed2 = np.linalg.norm(seg_v, axis=1)
             nz = np.where(speed2 >= v_eps)[0]
             if nz.size > 0:
                 first = nz[0]
                 if first > 0:
                     seg_v[:first] = seg_v[first]
+            # -----------------------------------------------
 
-            # Assign per-sample velocities (piecewise-constant)
             vel[:-1] = seg_v
-            vel[-1] = seg_v[-1]
+            vel[-1]  = seg_v[-1]
 
+        # >>> THIS WAS MISSING <<<
+        trace[n] = (t_ns, pos, vel)
+
+    if not trace:
+        raise RuntimeError(f"mobility trace '{path}' parsed to 0 nodes (check header/columns)")
 
     return trace
+
 
 
 class TraceMobility:
