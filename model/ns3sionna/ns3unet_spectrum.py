@@ -8,6 +8,9 @@ import GPUtil
 import zmq
 import gc
 
+import csv 
+import bisect
+
 from common import message_pb2
 from common.message_debug import *
 
@@ -315,6 +318,157 @@ class UNetTdlPropagator:
         return H
     
 
+def _read_mobility_trace_csv(path: str):
+    """
+    Reads a CSV with at least: t_s, node, x, y, z
+    Returns dict: node_id -> (t_ns_sorted, pos_sorted (N,3), vel_sorted (N,3))
+    Uses piecewise-linear interpolation; velocity is segment slope.
+    """
+    with open(path, "r", newline="") as f:
+        # skip comments/blank lines until header
+        while True:
+            hdr_line = f.readline()
+            if hdr_line == "":
+                raise RuntimeError(f"mobility trace '{path}' has no header")
+            hdr_line = hdr_line.strip()
+            if hdr_line and not hdr_line.startswith("#"):
+                break
+
+        header = [h.strip().lower() for h in hdr_line.split(",")]
+        col = {name: i for i, name in enumerate(header)}
+
+        def need(name):
+            if name not in col:
+                raise RuntimeError(f"mobility trace '{path}' missing column '{name}' (have {header})")
+            return col[name]
+
+        it_t = need("t_s")
+        it_n = need("node")
+        it_x = need("x")
+        it_y = need("y")
+        it_z = need("z")
+
+        # continue reading from current position with csv.reader
+        reader = csv.reader(f)
+        raw = {}  # node -> list of (t_ns, (x,y,z))
+        for row in reader:
+            if not row:
+                continue
+            if row[0].strip().startswith("#"):
+                continue
+            # tolerate extra columns
+            if len(row) <= max(it_t, it_n, it_x, it_y, it_z):
+                continue
+
+            t_s = float(row[it_t].strip())
+            n = int(float(row[it_n].strip()))
+            x = float(row[it_x].strip())
+            y = float(row[it_y].strip())
+            z = float(row[it_z].strip())
+
+            t_ns = int(round(t_s * 1e9))
+            raw.setdefault(n, []).append((t_ns, np.array([x, y, z], dtype=np.float32)))
+
+    trace = {}
+    for n, items in raw.items():
+        # sort, de-dup by time
+        items.sort(key=lambda p: p[0])
+        t_ns = []
+        pos = []
+        last = None
+        for t, p in items:
+            if last is not None and t == last:
+                continue
+            t_ns.append(t)
+            pos.append(p)
+            last = t
+
+        t_ns = np.asarray(t_ns, dtype=np.int64)
+        pos = np.asarray(pos, dtype=np.float32)
+
+        # velocities: piecewise slopes
+        vel = np.zeros_like(pos, dtype=np.float32)
+        if len(t_ns) >= 2:
+            dt = (t_ns[1:] - t_ns[:-1]).astype(np.float64) / 1e9
+            dt = np.maximum(dt, 1e-12)
+            seg_v = (pos[1:] - pos[:-1]) / dt[:, None]
+            vel[:-1] = seg_v
+            vel[-1] = seg_v[-1]
+        trace[n] = (t_ns, pos, vel)
+
+    return trace
+
+
+class TraceMobility:
+    """
+    Mobility model driven by an external time->position trace.
+    Compatible with server calls:
+      - .pos, .velocity
+      - .get_pos_at(t_ns), .get_velo_at(t_ns)
+      - .update_pos(t_ns, pos, velo, ...) (no-op-ish, keeps latest)
+    """
+
+    def __init__(self, node_id: int, t_ns: np.ndarray, pos: np.ndarray, vel: np.ndarray):
+        self.node_id = int(node_id)
+        self.t_ns = np.asarray(t_ns, dtype=np.int64)
+        self.pos_arr = np.asarray(pos, dtype=np.float32)
+        self.vel_arr = np.asarray(vel, dtype=np.float32)
+
+        # current state
+        self.pos = self.pos_arr[0].copy()
+        self.velocity = self.vel_arr[0].copy()
+
+        # optional history (kept for debugging; not required)
+        self.pos_history = {int(self.t_ns[0]): self.pos.copy()}
+
+    def _interp(self, t_ns: int):
+        t_ns = int(t_ns)
+
+        # clamp outside range
+        if t_ns <= int(self.t_ns[0]):
+            return self.pos_arr[0], self.vel_arr[0]
+        if t_ns >= int(self.t_ns[-1]):
+            return self.pos_arr[-1], self.vel_arr[-1]
+
+        i = bisect.bisect_right(self.t_ns.tolist(), t_ns) - 1
+        i = max(0, min(i, len(self.t_ns) - 2))
+
+        t0 = int(self.t_ns[i]); t1 = int(self.t_ns[i + 1])
+        p0 = self.pos_arr[i];    p1 = self.pos_arr[i + 1]
+
+        # linear interpolation
+        a = (t_ns - t0) / max(1.0, float(t1 - t0))
+        p = (1.0 - a) * p0 + a * p1
+
+        # piecewise-constant vel = segment slope
+        v = self.vel_arr[i]
+        return p.astype(np.float32), v.astype(np.float32)
+
+    def set_time(self, t_ns: int):
+        p, v = self._interp(t_ns)
+        self.pos = p
+        self.velocity = v
+        self.pos_history[int(t_ns)] = p.copy()
+
+    def get_pos_at(self, t_ns: int):
+        p, _ = self._interp(t_ns)
+        return p
+
+    def get_velo_at(self, t_ns: int):
+        _, v = self._interp(t_ns)
+        return v
+
+    def update_pos(self, t_ns, next_pos, velocity, *_args):
+        # if some legacy code calls this, accept it, but keep trace as truth.
+        self.pos = np.asarray(next_pos, dtype=np.float32)
+        self.velocity = np.asarray(velocity, dtype=np.float32)
+        self.pos_history[int(t_ns)] = self.pos.copy()
+
+    def check_set_new_velocity(self, *_args, **_kwargs):
+        # trace-driven: no random updates
+        return
+
+
 class SionnaEnv:
 
     # just compute the given single point-to-point channel
@@ -333,7 +487,8 @@ class SionnaEnv:
     def __init__(self, model_folder='./models/', rt_fast=False, default_mode=MODE_P2P, rt_max_parallel_links=256, est_csi=True, 
                  use_unet=False, unet_run="unet", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
                  VERBOSE=True,
-                 CHECKS_ENABLED=True):
+                 CHECKS_ENABLED=True,
+                 mobility_trace_in: str = ""):
         self.model_folder = model_folder
         self.rt_fast = rt_fast
         if rt_fast:
@@ -405,6 +560,10 @@ class SionnaEnv:
         }
         self._tim_print_every = 20
 
+        self.mobility_trace_in = mobility_trace_in
+        self._trace = None
+        self._use_trace = False
+
 
     def init_simulation_env(self, sim_init_msg):
         '''
@@ -465,6 +624,15 @@ class SionnaEnv:
         np.random.seed(sim_init_msg.seed)
         tf.random.set_seed(sim_init_msg.seed)
         self.my_seed = sim_init_msg.seed
+
+        # --- Optional deterministic mobility from trace ---
+        if getattr(self, "mobility_trace_in", ""):
+            print(f"[TRACE] Loading mobility trace: {self.mobility_trace_in}")
+            self._trace = _read_mobility_trace_csv(self.mobility_trace_in)
+            self._use_trace = True
+        else:
+            self._trace = None
+            self._use_trace = False
 
         ##SONIC
         if self.use_unet:
@@ -587,28 +755,34 @@ class SionnaEnv:
         # sim future node positions
         lah_time_vec = []
         for lah_i in range(look_ahead):
-            # move in time
-            dt = req_sim_time - self.sim_time
+            # Advance all relevant nodes to the *absolute* time req_sim_time
+            # (this function should internally compute dt = req_sim_time - self.sim_time,
+            #  update positions/velocities, and set self.sim_time = req_sim_time)
+            self._advance_nodes_to_time(req_sim_time, nodes_to_update)
 
+            # Now we are "at" req_sim_time
+            lah_time_vec.append(req_sim_time)
+
+            # Compute Tc at this time using the updated node states
             csi_tc_arr = []
             for node_id in nodes_to_update:
-                # perform walk
-                self._walk(node_id, dt)
-                if node_id != tx_node_id:
-                    tc = coherence_from_velocities(self.node_info[node_id].velocity,
-                                                    self.node_info[tx_node_id].velocity, self.fc,
-                                                    pos_tx=self.node_info[node_id].pos,
-                                                    pos_rx=self.node_info[tx_node_id].pos)
-                    csi_tc_arr.append(tc)
+                if node_id == tx_node_id:
+                    continue
 
-            # take the worst case Tc from all RX nodes
-            Tc_p2mp = int(np.min(np.asarray(csi_tc_arr)))
+                tc = coherence_from_velocities(
+                    self.node_info[node_id].velocity,
+                    self.node_info[tx_node_id].velocity,
+                    self.fc,
+                    pos_tx=self.node_info[node_id].pos,
+                    pos_rx=self.node_info[tx_node_id].pos,
+                )
+                csi_tc_arr.append(tc)
 
-            # update time
-            self.sim_time = req_sim_time
-            lah_time_vec.append(req_sim_time)
-            # new req time is old + Tc
+            Tc_p2mp = int(np.min(np.asarray(csi_tc_arr))) if len(csi_tc_arr) else MAX_COHERENCE_TIME
+
+            # Next lookahead time
             req_sim_time = req_sim_time + Tc_p2mp
+
 
 
         # place TX and RX nodes together with their future positions
@@ -1052,8 +1226,8 @@ class SionnaEnv:
         
         t_req0 = perf_counter()
 
-        # execute mobility
-        dt = req_sim_time - self.sim_time
+        # # execute mobility
+        # dt = req_sim_time - self.sim_time
 
         # estimate the node we need to update their position
         if req_mode == SionnaEnv.MODE_P2P:
@@ -1062,11 +1236,13 @@ class SionnaEnv:
             # both P2MP and P2MP_LAH
             nodes_to_update = list(self.node_info.keys())
 
-        for node_id in nodes_to_update:
-            self._walk(node_id, dt)
+        # for node_id in nodes_to_update:
+        #     self._walk(node_id, dt)
 
-        # update time
-        self.sim_time = req_sim_time
+        # # update time
+        # self.sim_time = req_sim_time
+
+        self._advance_nodes_to_time(req_sim_time, nodes_to_update)
 
         # place TX and RX
         rx_nodes = nodes_to_update
@@ -1311,6 +1487,36 @@ class SionnaEnv:
 
 
     def _init_mobility(self, sim_init_msg):
+
+        # If trace mode: ignore sim_init_msg mobility models and drive from CSV.
+        if getattr(self, "_use_trace", False):
+            for node_info in sim_init_msg.nodes:
+                nid = int(node_info.id)
+
+                if nid in self._trace:
+                    t_ns, pos, vel = self._trace[nid]
+                    self.node_info[nid] = TraceMobility(nid, t_ns, pos, vel)
+                else:
+                    # fallback: use whatever init msg says (constant) if node missing in trace
+                    if node_info.HasField("constant_position_model"):
+                        pos = node_info.constant_position_model.position
+                        self.node_info[nid] = ConstantMobility(nid, [pos.x, pos.y, pos.z])
+                    elif node_info.HasField("random_walk_model"):
+                        pos = node_info.random_walk_model.position
+                        self.node_info[nid] = ConstantMobility(nid, [pos.x, pos.y, pos.z])
+                    else:
+                        self.node_info[nid] = ConstantMobility(nid, [0.0, 0.0, 0.0])
+
+            # initialize server time to trace start if you want (optional)
+            self.sim_time = 0
+            for nid, m in self.node_info.items():
+                if isinstance(m, TraceMobility):
+                    # snap to t=0 (or earliest trace time)
+                    m.set_time(0)
+
+            print(f"[TRACE] Enabled trace mobility for {sum(isinstance(m, TraceMobility) for m in self.node_info.values())} nodes")
+            return
+        
         # Store information about each node: ID, mobility model
         for node_info in sim_init_msg.nodes:
             if (node_info.HasField("constant_position_model")):
@@ -1360,6 +1566,22 @@ class SionnaEnv:
                 self.node_info[node_info.id] = RandomWalkMobility(node_info.id, [pos.x, pos.y, pos.z],
                                                                   mode, mode_params, speed, speed_params,
                                                                   direction, direction_params)
+
+    def _advance_nodes_to_time(self, req_sim_time: int, nodes_to_update: list):
+        if getattr(self, "_use_trace", False):
+            for nid in nodes_to_update:
+                m = self.node_info[nid]
+                if isinstance(m, TraceMobility):
+                    m.set_time(req_sim_time)
+            self.sim_time = req_sim_time
+            return
+
+        # original behavior
+        dt = req_sim_time - self.sim_time
+        for nid in nodes_to_update:
+            self._walk(nid, dt)
+        self.sim_time = req_sim_time
+
 
 
     def run(self):
@@ -1447,6 +1669,8 @@ class SionnaEnv:
         del self.scene
         gc.collect()  # force garbage collection
 
+    
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -1465,6 +1689,8 @@ if __name__ == '__main__':
     parser.add_argument("--unet_y_wb_idx", type=int, default=0, help="Which output channel is wb_loss")
     parser.add_argument("--unet_y_tau_rms_idx", type=int, default=2, help="Which output channel is tau_rms (ns)")
     parser.add_argument("--unet_y_excess_idx", type=int, default=-1, help="Optional channel index for excess delay (ns), -1 disables")
+    parser.add_argument("--mobility_trace_in", type=str, default="",
+                    help="CSV with t_s,node,x,y,z,... used to drive mobility deterministically")
     args = parser.parse_args()
 
     print("ns3sionna v1.0")
@@ -1475,7 +1701,8 @@ if __name__ == '__main__':
         env = SionnaEnv(args.model_folder, args.rt_fast, args.default_mode, args.rt_max_parallel_links,
                         args.est_csi, args.use_unet, args.unet_run, args.unet_device, args.unet_no_path_wb,
                         args.unet_y_wb_idx,  args.unet_y_tau_rms_idx, args.unet_y_excess_idx,
-                        VERBOSE=args.verbose)
+                        VERBOSE=args.verbose,
+                        mobility_trace_in=args.mobility_trace_in)
         env.run()
 
         if args.single_run:
