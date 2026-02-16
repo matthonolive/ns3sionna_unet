@@ -264,6 +264,49 @@ struct PairAgg
     uint64_t rxForJitter = 0;
 };
 
+static void ApplyMobilityTraceSchedulePositions(const std::string& path,
+                                                const NodeContainer& nodes,
+                                                const std::vector<Vector>& initPos)
+{
+    auto trace = ReadMobilityTraceCsv(path);
+    uint32_t N = nodes.GetN();
+    NS_ABORT_MSG_IF(initPos.size() != N, "initPos size mismatch");
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        Ptr<MobilityModel> mm = nodes.Get(i)->GetObject<MobilityModel>();
+        NS_ABORT_MSG_IF(!mm, "Node " << i << " missing MobilityModel");
+
+        // Choose initial position: trace t=0 if present else placements initPos
+        Vector p0 = initPos[i];
+        auto it = trace.find(i);
+        if (it != trace.end() && !it->second.empty() && std::abs(it->second.front().first) < 1e-12)
+        {
+            p0 = it->second.front().second;
+        }
+
+        // Set at t=0 by scheduling, so it happens before other t=0 events (logger, etc.)
+        Simulator::Schedule(Seconds(0.0), &MobilityModel::SetPosition, mm, p0);
+
+        // Schedule all subsequent samples
+        if (it != trace.end())
+        {
+            for (const auto& tp : it->second)
+            {
+                double t = tp.first;
+                if (t <= 0.0) continue;
+                Simulator::Schedule(Seconds(t), &MobilityModel::SetPosition, mm, tp.second);
+            }
+        }
+        else
+        {
+            // Optional: if you want strictness, abort instead of silently holding initPos
+            // NS_ABORT_MSG("mobilityTraceIn missing node " << i);
+        }
+    }
+}
+
+
 static void
 WriteFlowMonitorCsv(Ptr<FlowMonitor> monitor,
                     FlowMonitorHelper& helper,
@@ -916,15 +959,28 @@ main(int argc, char* argv[])
 
     if (useSionna)
     {
-        // ns3sionna requires SionnaMobilityModel (positions updated from server responses)
         MobilityHelper mobility;
         mobility.SetMobilityModel("ns3::SionnaMobilityModel");
         mobility.Install(nodes);
 
+        // Set a sane initial position immediately too (optional but nice)
         nodes.Get(0)->GetObject<MobilityModel>()->SetPosition(txPos);
         for (uint32_t k = 0; k < staPos.size(); ++k)
             nodes.Get(1 + k)->GetObject<MobilityModel>()->SetPosition(staPos[k]);
+
+        if (!mobilityTraceIn.empty())
+        {
+            // Drive SionnaMobilityModel positions from the trace
+            ApplyMobilityTraceSchedulePositions(mobilityTraceIn, nodes, initPos);
+
+            // Make sure RandomWalk doesn't overwrite your scheduled trace positions
+            enableMobility = false;
+
+            // You also don't need poke anymore for correctness
+            pokeSionnaPositions = false;
+        }
     }
+
     else
     {
         // Friis: either replay a trace (best for apples-to-apples vs ns3sionna),
