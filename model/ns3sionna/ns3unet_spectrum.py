@@ -391,10 +391,37 @@ def _read_mobility_trace_csv(path: str):
         if len(t_ns) >= 2:
             dt = (t_ns[1:] - t_ns[:-1]).astype(np.float64) / 1e9
             dt = np.maximum(dt, 1e-12)
-            seg_v = (pos[1:] - pos[:-1]) / dt[:, None]
+
+            seg_v = (pos[1:] - pos[:-1]) / dt[:, None]  # (N-1,3) float
+            seg_v = seg_v.astype(np.float32, copy=False)
+
+            # --- FIX: avoid zero-velocity segments causing huge coherence times ---
+            # Threshold (m/s) below which we treat velocity as "effectively zero"
+            v_eps = 1e-3
+
+            speed = np.linalg.norm(seg_v, axis=1)  # (N-1,)
+
+            # 1) forward-fill zeros using last nonzero velocity
+            last = None
+            for i in range(seg_v.shape[0]):
+                if speed[i] < v_eps:
+                    if last is not None:
+                        seg_v[i] = last
+                else:
+                    last = seg_v[i].copy()
+
+            # 2) back-fill leading zeros using first nonzero velocity (if any)
+            speed2 = np.linalg.norm(seg_v, axis=1)
+            nz = np.where(speed2 >= v_eps)[0]
+            if nz.size > 0:
+                first = nz[0]
+                if first > 0:
+                    seg_v[:first] = seg_v[first]
+
+            # Assign per-sample velocities (piecewise-constant)
             vel[:-1] = seg_v
             vel[-1] = seg_v[-1]
-        trace[n] = (t_ns, pos, vel)
+
 
     return trace
 
@@ -1686,7 +1713,7 @@ if __name__ == '__main__':
     parser.add_argument("--unet_run", type=str, default="unet", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
     parser.add_argument("--unet_device", type=str, default="cuda", help="cpu|cuda|cuda:0")
     parser.add_argument("--unet_no_path_wb", type=float, default=199.5, help="No-path sentinel wb_loss (dB)")
-    parser.add_argument("--unet_y_wb_idx", type=int, default=0, help="Which output channel is wb_loss")
+    parser.add_argument("--unet_y_wb_idx", type=int, default=0, help="Which output channel is delta_wb (dB)")
     parser.add_argument("--unet_y_tau_rms_idx", type=int, default=2, help="Which output channel is tau_rms (ns)")
     parser.add_argument("--unet_y_excess_idx", type=int, default=-1, help="Optional channel index for excess delay (ns), -1 disables")
     parser.add_argument("--mobility_trace_in", type=str, default="",
