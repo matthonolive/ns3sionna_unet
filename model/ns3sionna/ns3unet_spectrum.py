@@ -325,7 +325,7 @@ class UNetTdlPropagator:
         df = self.subcarrier_spacing_hz
         Ts = 1.0 / (N * df)
 
-        tau = max(float(tau_rms_ns), 1e-3) * 1e-9
+        tau_rms = max(float(tau_rms_ns), 1e-3) * 1e-9
 
         #Rician K-factor
         K_lin = 10.0**(float(K_db) / 10.0)
