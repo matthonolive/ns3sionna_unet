@@ -345,9 +345,9 @@ class UNetTdlPropagator:
             tau_d = tau_rms
 
         
-        L = int(np.clip(np.ceil(6.0 * tau / Ts), 1, N))
+        L = int(np.clip(np.ceil(6.0 * tau_d / Ts), 1, N))
         t = np.arange(L, dtype=np.float64) * Ts
-        p = np.exp(-t / max(tau, 1e-12))
+        p = np.exp(-t / max(tau_d, 1e-12))
         p = p / (p.sum() + 1e-12)
 
         rng = np.random.default_rng(seed)
