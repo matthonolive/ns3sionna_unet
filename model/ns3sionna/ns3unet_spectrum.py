@@ -296,20 +296,68 @@ class UNetTdlPropagator:
         ex = self._trilerp(maps[:, self.y_excess_idx, :, :], kf, yf, xf) if self.y_excess_idx >= 0 else None
         return float(wb), float(tau), (None if ex is None else float(ex))
 
-    def synthesize_cfr(self, tau_rms_ns: float, seed: int) -> np.ndarray:
+    def synthesize_cfr(self, tau_rms_ns: float, mi_scene, tx_xyz, rx_xyz, seed: int) -> np.ndarray:
+
+        def is_los_mi(mi_scene, tx_xyz, rx_xyz, eps=1e-2):
+            tx = np.asarray(tx_xyz, dtype=np.float32)
+            rx = np.asarray(rx_xyz, dtype=np.float32)
+            dvec = rx - tx
+            dist = float(np.linalg.norm(dvec))
+            if dist < 1e-6:
+                return True
+            direction = dvec / dist
+
+            # Nudge the origin forward a bit to avoid self-intersection / boundary precision issues
+            o = mi.Point3f(tx + eps * direction)
+            d = mi.Vector3f(direction)
+
+            ray = mi.Ray3f(o, d)
+            ray.maxt = mi.Float(max(dist - 2*eps, 0.0))
+
+            si = mi_scene.ray_intersect(ray, mi.RayFlags.Minimal, False, True)
+            return not bool(si.is_valid()) 
+
+        los = is_los_mi(mi_scene, tx_xyz, rx_xyz)
+
+        K_db = 8.0 if los else 0.0
         
         N = self.fft_size
         df = self.subcarrier_spacing_hz
         Ts = 1.0 / (N * df)
 
         tau = max(float(tau_rms_ns), 1e-3) * 1e-9
+
+        #Rician K-factor
+        K_lin = 10.0**(float(K_db) / 10.0)
+        if K_lin <= 0.0:
+            K_lin = 0.0
+
+        #Power split 
+        if K_lin > 0.0: 
+            p_spec = K_lin / (K_lin + 1.0)
+            p_diff = 1.0 / (K_lin + 1.0) 
+
+            tau_d = tau_rms * (K_lin + 1.0) / np.sqrt(2.0 * K_lin + 1.0)
+
+        else:
+            p_spec = 0.0
+            p_diff = 1.0
+            tau_d = tau_rms
+
+        
         L = int(np.clip(np.ceil(6.0 * tau / Ts), 1, N))
         t = np.arange(L, dtype=np.float64) * Ts
         p = np.exp(-t / max(tau, 1e-12))
         p = p / (p.sum() + 1e-12)
 
         rng = np.random.default_rng(seed)
-        taps = (rng.standard_normal(L) + 1j * rng.standard_normal(L)) * np.sqrt(0.5 * p)
+
+        w = (rng.standard_normal(L) + 1j * rng.standard_normal(L)) * np.sqrt(0.5)
+        taps = w * np.sqrt(p_diff * p)
+
+        if p_spec > 0.0:
+            phi = rng.uniform(0.0, 2.0 * np.pi)
+            taps[0] += np.sqrt(p_spec) * np.exp(1j * phi)
 
         H = np.fft.fft(taps, n=N).astype(np.complex64)
         H = H / np.sqrt(np.mean(np.abs(H) ** 2) + 1e-12)
@@ -1002,7 +1050,7 @@ class SionnaEnv:
                             ^ (int(curr_rx_node) * 97531)
                             ^ (int(lah_time) & 0xFFFFFFFF)
                         )
-                        h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, seed=seed)
+                        h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed)
 
                         if self.CHECKS_ENABLED:
                             p = float(np.mean(np.abs(h_norm) ** 2))
@@ -1354,7 +1402,7 @@ class SionnaEnv:
                     f"tau_rms={tau_rms_ns:.4f} ns"
                 )
                 
-                h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, seed=seed)
+                h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed)
 
                 # sanity: mean |H|^2 ~ 1
                 if self.CHECKS_ENABLED:
