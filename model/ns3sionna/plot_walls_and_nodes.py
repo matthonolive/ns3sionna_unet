@@ -138,7 +138,7 @@ def main():
     ax.scatter([tx[0]],[tx[1]], marker="*", s=180, label="AP/TX")
     for i,p in enumerate(stas):
         ax.scatter([p[0]],[p[1]], s=40)
-        ax.text(p[0],p[1], f"STA{i}", fontsize=8, ha="left", va="bottom")
+        #ax.text(p[0],p[1], f"STA{i}", fontsize=8, ha="left", va="bottom")
     ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
     ax.legend(loc="upper right")
     fig.tight_layout()
