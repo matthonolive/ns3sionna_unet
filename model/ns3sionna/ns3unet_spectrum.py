@@ -1888,8 +1888,15 @@ class SionnaEnv:
                 else:
                     h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
 
-                if self.VERBOSE:
-                    print(f"[COST231] tx={tx_node} rx={curr_rx_node} d={d_m:.3f}m wb={wb_db:.2f}dB tau_rms={tau_rms_ns:.2f}ns")
+                friis_loss_db = fspl_db(d_m, self.fc)
+                print(f"[FRIIS] tx={tx_node} rx={curr_rx_node} d={d_m:.3f} m fspl={friis_loss_db:.2f} dB")
+                print(f"Wideband loss: rx={curr_rx_node} wb={wb_db:.1f}dB")
+                print(
+                    f"[COST231] tx={tx_node} rx={curr_rx_node} "
+                    f"d={d_m:.3f} m "
+                    f"delay={int(round(base_ns + ex))} ns (raw={base_ns + ex:.3f}; base={base_ns:.3f}+ex={ex:.3f}) "
+                    f"tau_rms={tau_rms_ns:.4f} ns"
+                )
 
             t_total = perf_counter() - t0
             print(f"[TIM] cost231 total={1e3*t_total:.2f} ms", flush=True)
