@@ -138,10 +138,19 @@ class UNetTdlPropagator:
         self._rx_grid = None
         self._rx_coords = None
         self._origin = None
+        self._needs_tiling = False
+        self._bbox_min_x = 0.0
+        self._bbox_min_y = 0.0
 
         # cache per TX
         self._cached_tx_key = None
         self._cached_maps = None  # (K,y_ch,H,W) float32
+
+        # cache for tiling mode
+        self._cached_patch_key = None
+        self._cached_patch_origin = None  # (3,) float32
+        self._cached_patch_maps = None    # (K,y_ch,H,W) float32
+        self._cached_tile_tx_key = None   # TX key for tiled patches
 
     def attach_scene(self, sionna_scene, bbox, fc_hz: float, fft_size: int, subcarrier_spacing_hz: float, frequencies_hz: np.ndarray):
         self.fc_hz = float(fc_hz)
@@ -187,6 +196,81 @@ class UNetTdlPropagator:
         Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
         self._rx_coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
 
+        # detect whether the scene is larger than one patch
+        self._bbox_min_x = float(bbox.min.x)
+        self._bbox_min_y = float(bbox.min.y)
+        scene_cells_x = int(np.ceil((float(bbox.max.x) - self._bbox_min_x) / self.scale_m))
+        scene_cells_y = int(np.ceil((float(bbox.max.y) - self._bbox_min_y) / self.scale_m))
+        self._needs_tiling = (scene_cells_x > self.W) or (scene_cells_y > self.H)
+
+        if self._needs_tiling:
+            print(f"[UNet] Scene is {scene_cells_x}x{scene_cells_y} cells, patch is {self.W}x{self.H} -> tiling enabled")
+        else:
+            print(f"[UNet] Scene is {scene_cells_x}x{scene_cells_y} cells, fits in one patch -> tiling disabled")
+
+    def _patch_key_for(self, rx_xyz):
+        """Snap an RX position to a patch-grid cell (stride = half patch)."""
+        stride = (self.W // 2) * self.scale_m  # 32 cells in meters
+        ix = int(np.floor((rx_xyz[0] - self._bbox_min_x) / stride))
+        iy = int(np.floor((rx_xyz[1] - self._bbox_min_y) / stride))
+        return (ix, iy)
+
+    def _patch_origin_for(self, patch_key, rx_xyz):
+        """Compute the world-space origin of a patch, ensuring RX is inside."""
+        stride = (self.W // 2) * self.scale_m
+        # start from the grid-snapped position
+        x0 = self._bbox_min_x + patch_key[0] * stride
+        y0 = self._bbox_min_y + patch_key[1] * stride
+        # clamp so patch doesn't extend past the original origin on the low end
+        x0 = max(x0, self._bbox_min_x)
+        y0 = max(y0, self._bbox_min_y)
+        return np.array([x0, y0, self._origin[2]], dtype=np.float32)
+
+    def _run_patch(self, patch_key, tx_pos, rx_xyz):
+        """Build features for a 64x64 patch and run inference."""
+        from dataclasses import replace as dc_replace
+
+        patch_origin = self._patch_origin_for(patch_key, rx_xyz)
+
+        rx_grid = AntennaGrid(
+            origin=patch_origin,
+            deltas=np.asarray([
+                [self.scale_m, 0.0, 0.0],
+                [0.0, self.scale_m, 0.0],
+                [0.0, 0.0, self.z_step_m],
+            ], dtype=np.float32),
+            shape=(self.K, self.H, self.W),
+        )
+
+        # build RX coords for this patch
+        xs = patch_origin[0] + self.scale_m * np.arange(self.W, dtype=np.float32)
+        ys = patch_origin[1] + self.scale_m * np.arange(self.H, dtype=np.float32)
+        zs = patch_origin[2] + self.z_step_m * np.arange(self.K, dtype=np.float32)
+        Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
+        rx_coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
+
+        adb = AntennaDatabase(tx_pos.reshape(1, 3), rx_coords, None, rx_grid)
+        patch_scene = dc_replace(self._base_scene, antenna_database=adb)
+
+        x = build_feature_tensor(patch_scene, self.fc_hz, requested=self.dataset_features).astype(np.float32)
+        c_in = x.shape[1]
+        x_stack = x.transpose(0, 2, 1, 3, 4).reshape(1, self.K * c_in, self.H, self.W)
+        x_chw = x_stack[0]
+
+        if self.keep_idx is not None:
+            x_chw = x_chw[self.keep_idx, :, :]
+
+        x_t = torch.from_numpy(x_chw).to(self.device)
+        pred = self._forward(x_t)
+
+        y_ch = 4
+        maps = pred.view(self.K, y_ch, self.H, self.W).detach().float().cpu().numpy()
+
+        self._cached_patch_key = patch_key
+        self._cached_patch_origin = patch_origin
+        self._cached_patch_maps = maps
+        self._cached_tile_tx_key = tuple(np.round(tx_pos, 3).tolist())
+
     def _forward(self, x_chw: torch.Tensor) -> torch.Tensor:
         # x_chw: (C_model,H,W)
         x_n = (x_chw - self.x_mean) / self.x_std
@@ -199,6 +283,19 @@ class UNetTdlPropagator:
         assert self._base_scene is not None, "call attach_scene() first"
 
         tx_pos_xyz = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
+
+        if self._needs_tiling:
+            # In tiling mode, we defer inference to sample_heads.
+            # Just store the TX position for later.
+            key = tuple(np.round(tx_pos_xyz, 3).tolist())
+            self._cached_tx_key = key
+            self._cached_tx_pos = tx_pos_xyz.copy()
+            # invalidate patch cache if TX changed
+            if self._cached_tile_tx_key != key:
+                self._cached_patch_key = None
+                self._cached_patch_maps = None
+            return
+
         key = tuple(np.round(tx_pos_xyz, 3).tolist())
         if key == self._cached_tx_key and self._cached_maps is not None:
             return
@@ -279,15 +376,31 @@ class UNetTdlPropagator:
         return float(c0 * (1 - wk) + c1 * wk)
 
     def sample_heads(self, rx_pos_xyz: np.ndarray):
-        assert self._cached_maps is not None, "call predict_for_tx() first"
 
         rx = np.asarray(rx_pos_xyz, dtype=np.float32).reshape(3)
-        x0, y0, z0 = self._origin.tolist()
-        xf = (rx[0] - x0) / self.scale_m
-        yf = (rx[1] - y0) / self.scale_m
-        kf = (rx[2] - z0) / self.z_step_m
+        if not self._needs_tiling:
+            # Original path: single full-scene grid
+            assert self._cached_maps is not None, "call predict_for_tx() first"
+            x0, y0, z0 = self._origin.tolist()
+            xf = (rx[0] - x0) / self.scale_m
+            yf = (rx[1] - y0) / self.scale_m
+            kf = (rx[2] - z0) / self.z_step_m
+            maps = self._cached_maps
+        else:
+            # Tiling path: check if RX is in the current cached patch
+            patch_key = self._patch_key_for(rx)
+            tx_key = self._cached_tx_key
 
-        maps = self._cached_maps  # (K,3,H,W)
+            if (patch_key != self._cached_patch_key or
+                    tx_key != self._cached_tile_tx_key or
+                    self._cached_patch_maps is None):
+                self._run_patch(patch_key, self._cached_tx_pos, rx)
+
+            x0, y0, z0 = self._cached_patch_origin.tolist()
+            xf = (rx[0] - x0) / self.scale_m
+            yf = (rx[1] - y0) / self.scale_m
+            kf = (rx[2] - z0) / self.z_step_m
+            maps = self._cached_patch_maps
 
         if (xf < 0 or xf > self.W-1 or yf < 0 or yf > self.H-1 or kf < 0 or kf > self.K-1):
             print(f"[warn] RX outside grid -> clamping: xf={xf:.2f}, yf={yf:.2f}, kf={kf:.2f}, rx={rx}")
