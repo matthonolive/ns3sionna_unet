@@ -650,6 +650,207 @@ class TraceMobility:
         return
 
 
+class Cost231Propagator:
+    """COST-231 multi-wall model. Same interface as UNetTdlPropagator but no neural network."""
+
+    def __init__(self, scale_m=0.625, K=4, H=64, W=64, z_step_cells=1.0,
+                 z_margin_m=0.3125, origin_xy_mode="bbox_min",
+                 dataset_features=None, no_path_wb=199.5, fft_shift=False,
+                 default_tau_rms_ns=5.0):
+        self.scale_m = float(scale_m)
+        self.H, self.W, self.K = int(H), int(W), int(K)
+        self.z_step_m = float(scale_m * z_step_cells)
+        self.z_margin_m = float(z_margin_m)
+        self.origin_xy_mode = origin_xy_mode
+        self.no_path_wb = float(no_path_wb)
+        self.fft_shift = bool(fft_shift)
+        self.default_tau_rms_ns = float(default_tau_rms_ns)
+
+        if dataset_features is None:
+            dataset_features = ["cost"]
+        self.dataset_features = list(dataset_features)
+
+        self._base_scene = None
+        self._rx_grid = None
+        self._rx_coords = None
+        self._origin = None
+
+        self._cached_tx_key = None
+        self._cached_cost_map = None  # (K, H, W) total path loss in dB (negative)
+
+    def attach_scene(self, sionna_scene, bbox, fc_hz, fft_size, subcarrier_spacing_hz, frequencies_hz):
+        self.fc_hz = float(fc_hz)
+        self.fft_size = int(fft_size)
+        self.subcarrier_spacing_hz = float(subcarrier_spacing_hz)
+        self.frequencies = np.asarray(frequencies_hz, dtype=np.float64)
+
+        self._base_scene = MlinkScene.from_sionna(sionna_scene)
+
+        off = self.frequencies - self.fc_hz
+        if (off[0] < 0) and (off[-1] > 0) and np.all(np.diff(off) > 0):
+            self.fft_shift = True
+        else:
+            self.fft_shift = False
+
+        if self.origin_xy_mode == "zero":
+            x0 = 0.0; y0 = 0.0
+        else:
+            x0 = float(bbox.min.x); y0 = float(bbox.min.y)
+
+        z_min = float(bbox.min.z); z_max = float(bbox.max.z)
+        total_span = (self.K - 1) * self.z_step_m
+        z0 = z_min + self.z_margin_m
+        if z0 + total_span > (z_max - self.z_margin_m):
+            z0 = max(z_min, (z_max - self.z_margin_m) - total_span)
+
+        self._origin = np.array([x0, y0, z0], dtype=np.float32)
+
+        self._rx_grid = AntennaGrid(
+            origin=self._origin,
+            deltas=np.asarray([
+                [self.scale_m, 0, 0],
+                [0, self.scale_m, 0],
+                [0, 0, self.z_step_m],
+            ], dtype=np.float32),
+            shape=(self.K, self.H, self.W),
+        )
+
+        xs = x0 + self.scale_m * np.arange(self.W, dtype=np.float32)
+        ys = y0 + self.scale_m * np.arange(self.H, dtype=np.float32)
+        zs = z0 + self.z_step_m * np.arange(self.K, dtype=np.float32)
+        Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
+        self._rx_coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
+
+    def predict_for_tx(self, tx_pos_xyz):
+        assert self._base_scene is not None, "call attach_scene() first"
+        tx_pos_xyz = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
+        key = tuple(np.round(tx_pos_xyz, 3).tolist())
+        if key == self._cached_tx_key and self._cached_cost_map is not None:
+            return
+
+        adb = AntennaDatabase(tx_pos_xyz.reshape(1, 3), self._rx_coords, None, self._rx_grid)
+        scene = replace(self._base_scene, antenna_database=adb)
+
+        # cost feature: (1, 1, K, H, W) — total path loss (negative dB)
+        x = build_feature_tensor(scene, self.fc_hz, requested=["cost"]).astype(np.float32)
+        # shape is (num_tx=1, c_in=1, K, H, W)
+        self._cached_cost_map = x[0, 0]  # (K, H, W)
+        self._cached_tx_key = key
+        self._cached_tx_pos = tx_pos_xyz.copy()
+
+    def _trilerp(self, vol_khw, kf, yf, xf):
+        K, H, W = vol_khw.shape
+        kf = float(np.clip(kf, 0, K - 1))
+        yf = float(np.clip(yf, 0, H - 1))
+        xf = float(np.clip(xf, 0, W - 1))
+
+        k0 = int(np.floor(kf)); k1 = min(k0 + 1, K - 1); wk = kf - k0
+        y0 = int(np.floor(yf)); y1 = min(y0 + 1, H - 1); wy = yf - y0
+        x0 = int(np.floor(xf)); x1 = min(x0 + 1, W - 1); wx = xf - x0
+
+        c000 = vol_khw[k0, y0, x0]; c001 = vol_khw[k0, y0, x1]
+        c010 = vol_khw[k0, y1, x0]; c011 = vol_khw[k0, y1, x1]
+        c100 = vol_khw[k1, y0, x0]; c101 = vol_khw[k1, y0, x1]
+        c110 = vol_khw[k1, y1, x0]; c111 = vol_khw[k1, y1, x1]
+
+        c00 = c000 * (1 - wx) + c001 * wx
+        c01 = c010 * (1 - wx) + c011 * wx
+        c10 = c100 * (1 - wx) + c101 * wx
+        c11 = c110 * (1 - wx) + c111 * wx
+
+        c0 = c00 * (1 - wy) + c01 * wy
+        c1 = c10 * (1 - wy) + c11 * wy
+
+        return float(c0 * (1 - wk) + c1 * wk)
+
+    def sample_heads(self, rx_pos_xyz):
+        assert self._cached_cost_map is not None, "call predict_for_tx() first"
+        rx = np.asarray(rx_pos_xyz, dtype=np.float32).reshape(3)
+        x0, y0, z0 = self._origin.tolist()
+        xf = (rx[0] - x0) / self.scale_m
+        yf = (rx[1] - y0) / self.scale_m
+        kf = (rx[2] - z0) / self.z_step_m
+
+        # cost feature is total path loss (negative dB, e.g. -85)
+        # wb_loss = -cost_value
+        cost_val = self._trilerp(self._cached_cost_map, kf, yf, xf)
+        wb_db = -cost_val
+
+        # COST-231 has no delay information — use a fixed default
+        tau_rms_ns = self.default_tau_rms_ns
+        excess_ns = 0.0
+
+        return float(wb_db), float(tau_rms_ns), float(excess_ns)
+
+    def synthesize_cfr(self, tau_rms_ns: float, mi_scene, tx_xyz, rx_xyz, seed: int) -> np.ndarray:
+
+        def is_los_mi(mi_scene, tx_xyz, rx_xyz, eps=1e-2):
+            tx = np.asarray(tx_xyz, dtype=np.float32)
+            rx = np.asarray(rx_xyz, dtype=np.float32)
+            dvec = rx - tx
+            dist = float(np.linalg.norm(dvec))
+            if dist < 1e-6:
+                return True
+            direction = dvec / dist
+
+            # Nudge the origin forward a bit to avoid self-intersection / boundary precision issues
+            o = mi.Point3f(tx + eps * direction)
+            d = mi.Vector3f(direction)
+
+            ray = mi.Ray3f(o, d)
+            ray.maxt = mi.Float(max(dist - 2*eps, 0.0))
+
+            si = mi_scene.ray_intersect(ray, mi.RayFlags.Minimal, False, True)
+            return not bool(si.is_valid()) 
+
+        los = is_los_mi(mi_scene, tx_xyz, rx_xyz)
+
+        K_db = 8.0 if los else 0.0
+        
+        N = self.fft_size
+        df = self.subcarrier_spacing_hz
+        Ts = 1.0 / (N * df)
+
+        tau_rms = max(float(tau_rms_ns), 1e-3) * 1e-9
+
+        #Rician K-factor
+        K_lin = 10.0**(float(K_db) / 10.0)
+        if K_lin <= 0.0:
+            K_lin = 0.0
+
+        #Power split 
+        if K_lin > 0.0: 
+            p_spec = K_lin / (K_lin + 1.0)
+            p_diff = 1.0 / (K_lin + 1.0) 
+
+            tau_d = tau_rms * (K_lin + 1.0) / np.sqrt(2.0 * K_lin + 1.0)
+
+        else:
+            p_spec = 0.0
+            p_diff = 1.0
+            tau_d = tau_rms
+
+        
+        L = int(np.clip(np.ceil(6.0 * tau_d / Ts), 1, N))
+        t = np.arange(L, dtype=np.float64) * Ts
+        p = np.exp(-t / max(tau_d, 1e-12))
+        p = p / (p.sum() + 1e-12)
+
+        rng = np.random.default_rng(seed)
+
+        w = (rng.standard_normal(L) + 1j * rng.standard_normal(L)) * np.sqrt(0.5)
+        taps = w * np.sqrt(p_diff * p)
+
+        if p_spec > 0.0:
+            phi = rng.uniform(0.0, 2.0 * np.pi)
+            taps[0] += np.sqrt(p_spec) * np.exp(1j * phi)
+
+        H = np.fft.fft(taps, n=N).astype(np.complex64)
+        H = H / np.sqrt(np.mean(np.abs(H) ** 2) + 1e-12)
+        if self.fft_shift:
+            H = np.fft.fftshift(H)
+        return H
+
 class SionnaEnv:
 
     # just compute the given single point-to-point channel
@@ -669,7 +870,8 @@ class SionnaEnv:
                  use_unet=False, unet_run="unet", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
                  VERBOSE=True,
                  CHECKS_ENABLED=True,
-                 mobility_trace_in: str = ""):
+                 mobility_trace_in: str = "",
+                 use_cost231=False, cost231_tau_rms_ns=5.0):
         self.model_folder = model_folder
         self.rt_fast = rt_fast
         if rt_fast:
@@ -715,6 +917,11 @@ class SionnaEnv:
 
         if not self.use_unet:
             print(f'Init ns3sionna with rt_fast={rt_fast}, est_csi={est_csi}')
+
+        # cost231
+        self.use_cost231 = use_cost231
+        self.cost231_tau_rms_ns = cost231_tau_rms_ns
+        self._cost231 = None
 
         self.VERBOSE = VERBOSE
         self.CHECKS_ENABLED = CHECKS_ENABLED
@@ -832,6 +1039,17 @@ class SionnaEnv:
                     origin_xy_mode="bbox_min", # or "zero" if your scenes are 0-based
                 )
             self._unet.attach_scene(self.scene, self.bbox, self.fc, self.fft_size, self.subcarrier_spacing, self.frequencies)
+
+        elif self.use_cost231:
+            if self._cost231 is None:
+                self._cost231 = Cost231Propagator(
+                    scale_m=0.625,
+                    z_step_cells=1.0,
+                    z_margin_m=0.625 * 0.5,
+                    origin_xy_mode="bbox_min",
+                    default_tau_rms_ns=self.cost231_tau_rms_ns,
+                )
+            self._cost231.attach_scene(self.scene, self.bbox, self.fc, self.fft_size, self.subcarrier_spacing, self.frequencies)
 
         # configure mobility models
         self._init_mobility(sim_init_msg)
@@ -976,6 +1194,19 @@ class SionnaEnv:
                                                          tx_node_id=tx_node_id,
                                                          rx_nodes=rx_nodes,
                                                          reply_wrapper=reply_wrapper)
+        
+        elif self.use_cost231:
+
+            return self._compute_cfr_with_lookahead_surrogate(
+                lah_time_vec=lah_time_vec,
+                tx_node_id=tx_node_id,
+                rx_nodes=rx_nodes,
+                reply_wrapper=reply_wrapper,
+                propagator=self._cost231,
+                no_path_wb=self._cost231.no_path_wb,
+                is_delta=False,
+                label="COST231-LAH",
+            )
 
         self._place_tx_rx_nodes_with_lah(lah_time_vec, tx_node_id, rx_nodes)
 
@@ -1192,6 +1423,99 @@ class SionnaEnv:
             f"{self.sim_time / 1e9}s: Computed CSI with Tc: "
             f"{np.round(np.asarray(Tc_p2mp_lah) / 1e6, 2)}ms, #links: {num_links} (UNet-LAH)"
         )
+        return num_links
+    
+    def _compute_cfr_with_lookahead_surrogate(self, lah_time_vec, tx_node_id, rx_nodes, reply_wrapper,
+                                               propagator, no_path_wb, is_delta, label):
+        """Generic LAH path for any propagator with predict_for_tx/sample_heads/synthesize_cfr interface."""
+
+        def fspl_db(d_m, fc_hz):
+            d_m = max(float(d_m), 1e-6)
+            lam = 299792458.0 / float(fc_hz)
+            return 20.0 * np.log10(4.0 * np.pi * d_m / lam)
+
+        freqs_list = self.frequencies.tolist()
+        zeros_f_list = np.zeros((self.fft_size,), dtype=np.float32).tolist()
+
+        tx_pos = np.array(self.node_info[tx_node_id].pos, dtype=np.float32)
+        propagator.predict_for_tx(tx_pos)
+
+        chan_response = reply_wrapper.channel_state_response
+        Tc_p2mp_lah = []
+        num_links = 0
+
+        for lah_time in lah_time_vec:
+            csi = chan_response.csi.add()
+            csi.start_time = int(lah_time)
+            csi.tx_node.id = int(tx_node_id)
+            csi.tx_node.position.x = float(tx_pos[0])
+            csi.tx_node.position.y = float(tx_pos[1])
+            csi.tx_node.position.z = float(tx_pos[2])
+
+            csi_tc_arr = []
+            for curr_rx_node in rx_nodes:
+                rx_pos = np.array(self.node_info[curr_rx_node].get_pos_at(lah_time), dtype=np.float32)
+
+                head_0, tau_rms_ns, excess_ns = propagator.sample_heads(rx_pos)
+                d_m = float(np.linalg.norm(tx_pos - rx_pos))
+
+                if is_delta:
+                    wb_db = float(fspl_db(d_m, self.fc) + float(head_0))
+                else:
+                    wb_db = float(head_0)
+
+                base_ns = d_m / 299792458.0 * 1e9
+                ex = 0.0 if excess_ns is None else float(max(0.0, excess_ns))
+
+                no_path = wb_db >= (no_path_wb - 1e-3)
+
+                rx_node_info = csi.rx_nodes.add()
+                rx_node_info.id = int(curr_rx_node)
+                rx_node_info.position.x = float(rx_pos[0])
+                rx_node_info.position.y = float(rx_pos[1])
+                rx_node_info.position.z = float(rx_pos[2])
+
+                if no_path:
+                    rx_node_info.delay = 0
+                    rx_node_info.wb_loss = float(no_path_wb)
+                    if self.est_csi:
+                        rx_node_info.frequencies.extend(freqs_list)
+                        rx_node_info.csi_imag.extend(zeros_f_list)
+                        rx_node_info.csi_real.extend(zeros_f_list)
+                else:
+                    rx_node_info.delay = int(round(base_ns + ex))
+                    rx_node_info.wb_loss = float(wb_db)
+                    if self.est_csi:
+                        seed = (
+                            (int(self.my_seed) * 1315423911)
+                            ^ (int(tx_node_id) * 2654435761)
+                            ^ (int(curr_rx_node) * 97531)
+                            ^ (int(lah_time) & 0xFFFFFFFF)
+                        )
+                        h_norm = propagator.synthesize_cfr(
+                            tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene,
+                            tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed,
+                        )
+                        rx_node_info.frequencies.extend(freqs_list)
+                        rx_node_info.csi_imag.extend(np.imag(h_norm).tolist())
+                        rx_node_info.csi_real.extend(np.real(h_norm).tolist())
+
+                tc = coherence_from_velocities(
+                    self.node_info[curr_rx_node].get_velo_at(lah_time),
+                    self.node_info[tx_node_id].velocity, self.fc,
+                    pos_tx=self.node_info[curr_rx_node].get_pos_at(lah_time),
+                    pos_rx=self.node_info[tx_node_id].pos,
+                )
+                rx_node_info.end_time2 = int(csi.start_time + tc)
+                csi_tc_arr.append(tc)
+                num_links += 1
+
+            Tc_p2mp = int(np.min(np.asarray(csi_tc_arr)))
+            Tc_p2mp_lah.append(Tc_p2mp)
+            csi.end_time = int(csi.start_time + Tc_p2mp - 1)
+
+        print(f"{self.sim_time / 1e9}s: Computed CSI with Tc: "
+              f"{np.round(np.asarray(Tc_p2mp_lah) / 1e6, 2)}ms, #links: {num_links} ({label})")
         return num_links
 
 
@@ -1527,6 +1851,48 @@ class SionnaEnv:
             t_total = perf_counter() - t0
             self._tim_add("unet", t_total)
             print(f"[TIM] unet breakdown: predict_for_tx={1e3*t_pred:.2f} ms total={1e3*t_total:.2f} ms", flush=True)
+
+            return rx_nodes, lnk_delay_arr, lnk_loss_arr, h_normalized_arr
+        
+        elif self.use_cost231:
+            t0 = perf_counter()
+            tx_pos = np.array(self.node_info[tx_node].pos, dtype=np.float32)
+
+            self._cost231.predict_for_tx(tx_pos)
+
+            lnk_delay_arr = []
+            lnk_loss_arr = []
+            h_normalized_arr = []
+
+            for curr_rx_node in rx_nodes:
+                rx_pos = np.array(self.node_info[curr_rx_node].pos, dtype=np.float32)
+
+                wb_db, tau_rms_ns, excess_ns = self._cost231.sample_heads(rx_pos)
+                d_m = float(np.linalg.norm(tx_pos - rx_pos))
+
+                if wb_db >= (self._cost231.no_path_wb - 1e-3):
+                    lnk_loss_arr.append(float(self._cost231.no_path_wb))
+                    lnk_delay_arr.append(0)
+                    h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
+                    continue
+
+                base_ns = d_m / 299792458.0 * 1e9
+                ex = float(max(0.0, excess_ns))
+                lnk_delay_arr.append(int(round(base_ns + ex)))
+                lnk_loss_arr.append(float(wb_db))
+
+                if self.est_csi:
+                    seed = (int(self.my_seed) * 1315423911) ^ (int(tx_node) * 2654435761) ^ (int(curr_rx_node) * 97531) ^ (int(self.sim_time) & 0xffffffff)
+                    h_norm = self._cost231.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed)
+                    h_normalized_arr.append(h_norm)
+                else:
+                    h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
+
+                if self.VERBOSE:
+                    print(f"[COST231] tx={tx_node} rx={curr_rx_node} d={d_m:.3f}m wb={wb_db:.2f}dB tau_rms={tau_rms_ns:.2f}ns")
+
+            t_total = perf_counter() - t0
+            print(f"[TIM] cost231 total={1e3*t_total:.2f} ms", flush=True)
 
             return rx_nodes, lnk_delay_arr, lnk_loss_arr, h_normalized_arr
 
@@ -1872,6 +2238,8 @@ if __name__ == '__main__':
     parser.add_argument("--unet_y_excess_idx", type=int, default=-1, help="Optional channel index for excess delay (ns), -1 disables")
     parser.add_argument("--mobility_trace_in", type=str, default="",
                     help="CSV with t_s,node,x,y,z,... used to drive mobility deterministically")
+    parser.add_argument("--use_cost231", action="store_true", help="Use COST-231 multi-wall model (no RT, no UNet)")
+    parser.add_argument("--cost231_tau_rms_ns", type=float, default=5.0, help="Default tau_rms (ns) for COST-231 CFR synthesis")
     args = parser.parse_args()
 
     print("ns3sionna v1.0")
@@ -1883,7 +2251,9 @@ if __name__ == '__main__':
                         args.est_csi, args.use_unet, args.unet_run, args.unet_device, args.unet_no_path_wb,
                         args.unet_y_wb_idx,  args.unet_y_tau_rms_idx, args.unet_y_excess_idx,
                         VERBOSE=args.verbose,
-                        mobility_trace_in=args.mobility_trace_in)
+                        mobility_trace_in=args.mobility_trace_in,
+                        use_cost231=args.use_cost231,
+                        cost231_tau_rms_ns=args.cost231_tau_rms_ns)
         env.run()
 
         if args.single_run:
