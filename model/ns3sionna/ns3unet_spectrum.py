@@ -432,7 +432,7 @@ class UNetTdlPropagator:
 
         los = is_los_mi(mi_scene, tx_xyz, rx_xyz)
 
-        K_db = 8.0 if los else 0.0
+        K_db = 15.0 if los else 5.0
         
         N = self.fft_size
         df = self.subcarrier_spacing_hz
@@ -805,7 +805,7 @@ class Cost231Propagator:
 
         los = is_los_mi(mi_scene, tx_xyz, rx_xyz)
 
-        K_db = 8.0 if los else 0.0
+        K_db = 15.0 if los else 5.0
         
         N = self.fft_size
         df = self.subcarrier_spacing_hz
@@ -1395,6 +1395,9 @@ class SionnaEnv:
                             ^ (int(lah_time) & 0xFFFFFFFF)
                         )
                         h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed)
+                        # mag_db = 20*np.log10(np.abs(h_norm) + 1e-12)
+                        # print("ripple_pp_dB=", float(mag_db.max() - mag_db.min()),
+                        #     "ripple_std_dB=", float(mag_db.std()))
 
                         if self.CHECKS_ENABLED:
                             p = float(np.mean(np.abs(h_norm) ** 2))
