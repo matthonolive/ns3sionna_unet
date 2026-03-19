@@ -146,6 +146,8 @@ class UNetTdlPropagator:
         self._cached_tx_key = None
         self._cached_maps = None  # (K,y_ch,H,W) float32
 
+        
+
         # cache for tiling mode
         self._cached_patch_key = None
         self._cached_patch_origin = None  # (3,) float32
@@ -311,6 +313,11 @@ class UNetTdlPropagator:
         x_stack = x.transpose(0, 2, 1, 3, 4).reshape(1, self.K * c_in, self.H, self.W)
         x_chw = x_stack[0]  # (K*c_in,H,W)
 
+        walls_khw = None
+        if "binary_walls" in self.dataset_features:
+            wall_idx = self.dataset_features.index("binary_walls")
+            walls_khw = x[0, wall_idx]   # shape: (K, H, W)
+
         if self.keep_idx is not None:
             if self.keep_idx.size != self.C_model:
                 raise RuntimeError(
@@ -348,6 +355,16 @@ class UNetTdlPropagator:
         maps = pred.view(self.K, y_ch, self.H, self.W).detach().float().cpu().numpy()
         self._cached_maps = maps
         self._cached_tx_key = key
+
+        # # DEBUG DUMP
+        # self._dump_wb_debug_png(
+        #     maps=maps,
+        #     tx_pos_xyz=tx_pos_xyz,
+        #     origin_xyz=self._origin,
+        #     walls_khw=walls_khw,
+        #     out_dir="debug_wb_unet",
+        #     prefix="unet_full",
+        # )
 
     # --- sampling + CFR synthesis stay the same as before ---
     def _trilerp(self, vol_khw: np.ndarray, kf: float, yf: float, xf: float) -> float:
@@ -408,6 +425,87 @@ class UNetTdlPropagator:
         tau = self._trilerp(maps[:, self.y_tau_rms_idx, :, :], kf, yf, xf)
         ex = self._trilerp(maps[:, self.y_excess_idx, :, :], kf, yf, xf) if self.y_excess_idx >= 0 else None
         return float(wb), float(tau), (None if ex is None else float(ex))
+    
+    def _dump_wb_debug_png(
+        self,
+        maps: np.ndarray,
+        tx_pos_xyz: np.ndarray,
+        origin_xyz: np.ndarray,
+        walls_khw: np.ndarray = None,
+        out_dir: str = "debug_wb_unet",
+        prefix: str = "unet",
+    ):
+        """
+        maps:      (K, y_ch, H, W)
+        tx_pos_xyz:(3,)
+        origin_xyz:(3,)
+        walls_khw: optional (K, H, W) binary wall map on same grid
+        """
+        import os
+        os.makedirs(out_dir, exist_ok=True)
+
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+
+        tx = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
+        x0, y0, z0 = [float(v) for v in origin_xyz]
+
+        xs = x0 + self.scale_m * np.arange(self.W, dtype=np.float32)
+        ys = y0 + self.scale_m * np.arange(self.H, dtype=np.float32)
+        zs = z0 + self.z_step_m * np.arange(self.K, dtype=np.float32)
+        Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
+
+        d_m = np.sqrt((X - tx[0])**2 + (Y - tx[1])**2 + (Z - tx[2])**2).astype(np.float32)
+        d_m = np.maximum(d_m, 1e-6)
+
+        lam = 299792458.0 / float(self.fc_hz)
+        fspl_db = 20.0 * np.log10(4.0 * np.pi * d_m / lam)
+
+        # current server logic treats y_wb_idx as delta over Friis
+        delta_db = maps[:, self.y_wb_idx, :, :]
+        wb_db = fspl_db + delta_db
+
+        wb_plot = wb_db.copy()
+        wb_plot[wb_plot >= (self.no_path_wb - 1e-3)] = np.nan
+
+        for k in range(self.K):
+            plt.figure(figsize=(6, 5))
+            im = plt.imshow(wb_plot[k], origin="lower")
+            plt.colorbar(im, label="Wideband loss (dB)")
+
+            if walls_khw is not None:
+                plt.contour(
+                    walls_khw[k],
+                    levels=[0.5],
+                    colors="white",
+                    linewidths=0.8,
+                    origin="lower",
+                )
+
+            plt.scatter(
+                [(tx[0] - x0) / self.scale_m],
+                [(tx[1] - y0) / self.scale_m],
+                c="red",
+                s=30,
+                marker="x",
+                label="TX",
+            )
+            plt.legend(loc="upper right")
+            plt.title(
+                f"{prefix} WB loss slice k={k}  "
+                f"TX=({tx[0]:.2f},{tx[1]:.2f},{tx[2]:.2f})"
+            )
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(
+                    out_dir,
+                    f"{prefix}_tx_{tx[0]:.2f}_{tx[1]:.2f}_{tx[2]:.2f}_k{k}.png",
+                ),
+                dpi=150,
+            )
+            plt.close()
+
 
     def synthesize_cfr(self, tau_rms_ns: float, mi_scene, tx_xyz, rx_xyz, seed: int) -> np.ndarray:
 
@@ -737,6 +835,32 @@ class Cost231Propagator:
         self._cached_cost_map = x[0, 0]  # (K, H, W)
         self._cached_tx_key = key
         self._cached_tx_pos = tx_pos_xyz.copy()
+
+
+        #  # --- DEBUG DUMP START ---
+        # import os
+        # import matplotlib.pyplot as plt
+
+        # os.makedirs("debug_cost231", exist_ok=True)
+
+        # # Optional: also get walls for overlay
+        # walls = build_feature_tensor(scene, self.fc_hz, requested=["binary_walls"]).astype(np.float32)[0, 0]
+
+        # for k in range(self._cached_cost_map.shape[0]):
+        #     loss_db = -self._cached_cost_map[k]   # convert from negative path-loss map to positive dB
+
+        #     plt.figure(figsize=(6, 5))
+        #     plt.imshow(loss_db, origin="lower")
+        #     plt.colorbar(label="COST231 path loss (dB)")
+
+        #     # overlay walls as contours
+        #     plt.contour(walls[k], levels=[0.5], linewidths=0.8)
+
+        #     plt.title(f"COST231 slice k={k} TX=({key[0]:.2f}, {key[1]:.2f}, {key[2]:.2f})")
+        #     plt.tight_layout()
+        #     plt.savefig(f"debug_cost231/cost231_tx_{key[0]:.2f}_{key[1]:.2f}_{key[2]:.2f}_k{k}.png", dpi=150)
+        #     plt.close()
+        # # --- DEBUG DUMP END ---
 
     def _trilerp(self, vol_khw, kf, yf, xf):
         K, H, W = vol_khw.shape
