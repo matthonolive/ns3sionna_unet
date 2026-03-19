@@ -1841,6 +1841,199 @@ class SionnaEnv:
             self.scene.add(rx)
             self.placed_radio_node_names.append(rx_node_name)
 
+    def _dump_rt_debug_png(
+        self,
+        tx_pos_xyz,
+        out_dir="debug_wb_rt",
+        prefix="rt_full",
+        batch_size=512,
+        scale_m=0.625,
+        K=4,
+        H=64,
+        W=64,
+        z_step_cells=1.0,
+        z_margin_m=0.3125,
+        origin_xy_mode="bbox_min",
+    ):
+        """
+        Ray-trace a full dense KxHxW receiver grid and dump WB-loss PNGs.
+        This is for debugging only: it can be expensive.
+        """
+        import os
+        os.makedirs(out_dir, exist_ok=True)
+
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+
+        tx_pos_xyz = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
+        z_step_m = float(scale_m * z_step_cells)
+
+        # --- build grid origin exactly like UNet attach_scene() ---
+        if origin_xy_mode == "zero":
+            x0 = 0.0
+            y0 = 0.0
+        else:
+            x0 = float(self.bbox.min.x)
+            y0 = float(self.bbox.min.y)
+
+        z_min = float(self.bbox.min.z)
+        z_max = float(self.bbox.max.z)
+        total_span = (K - 1) * z_step_m
+        z0 = z_min + z_margin_m
+        if z0 + total_span > (z_max - z_margin_m):
+            z0 = max(z_min, (z_max - z_margin_m) - total_span)
+
+        origin = np.array([x0, y0, z0], dtype=np.float32)
+
+        rx_grid = AntennaGrid(
+            origin=origin,
+            deltas=np.asarray(
+                [
+                    [scale_m, 0.0, 0.0],
+                    [0.0, scale_m, 0.0],
+                    [0.0, 0.0, z_step_m],
+                ],
+                dtype=np.float32,
+            ),
+            shape=(K, H, W),
+        )
+
+        xs = x0 + scale_m * np.arange(W, dtype=np.float32)
+        ys = y0 + scale_m * np.arange(H, dtype=np.float32)
+        zs = z0 + z_step_m * np.arange(K, dtype=np.float32)
+        Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
+        rx_coords = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
+
+        # --- build matching wall map using mlink feature pipeline ---
+        walls_khw = None
+        try:
+            adb = AntennaDatabase(tx_pos_xyz.reshape(1, 3), rx_coords, None, rx_grid)
+            dbg_scene = replace(MlinkScene.from_sionna(self.scene), antenna_database=adb)
+            wall_feat = build_feature_tensor(dbg_scene, self.fc, requested=["binary_walls"]).astype(np.float32)
+            walls_khw = wall_feat[0, 0]   # (K,H,W)
+        except Exception as e:
+            print(f"[RTDBG] failed to build binary_walls overlay: {e}")
+
+        # --- ray trace in batches ---
+        wb_flat = np.full((rx_coords.shape[0],), self.unet_no_path_wb, dtype=np.float32)
+
+        p_solver = PathSolver()
+
+        for start in range(0, rx_coords.shape[0], batch_size):
+            stop = min(start + batch_size, rx_coords.shape[0])
+            chunk = rx_coords[start:stop]
+
+            temp_names = []
+            try:
+                tx_name = "_dbg_tx"
+                tx = Transmitter(
+                    name=tx_name,
+                    position=tx_pos_xyz,
+                    orientation=[0, -180, 0],
+                    display_radius=0.1,
+                )
+                self.scene.add(tx)
+                temp_names.append(tx_name)
+
+                for j, pos in enumerate(chunk):
+                    rx_name = f"_dbg_rx_{j}"
+                    rx = Receiver(
+                        name=rx_name,
+                        position=pos,
+                        orientation=[0, -180, 0],
+                        display_radius=0.1,
+                    )
+                    self.scene.add(rx)
+                    temp_names.append(rx_name)
+
+                paths = p_solver(
+                    scene=self.scene,
+                    max_depth=self.rt_max_depth,
+                    samples_per_src=self.rt_samples_per_src,
+                    los=self.rt_los,
+                    specular_reflection=self.rt_specular_reflection,
+                    diffuse_reflection=self.rt_diffuse_reflection,
+                    refraction=self.rt_refraction,
+                    synthetic_array=self.rt_synthetic_array,
+                    diffraction=self.rt_diffraction,
+                    edge_diffraction=self.rt_edge_diffraction,
+                    diffraction_lit_region=self.rt_diffraction_lit_region,
+                )
+
+                a, tau = paths.cir(
+                    sampling_frequency=1e9,
+                    normalize_delays=False,
+                    out_type="numpy",
+                )
+
+                h_raw = paths.cfr(
+                    frequencies=self.frequencies,
+                    sampling_frequency=1.0,
+                    num_time_steps=1,
+                    normalize_delays=True,
+                    normalize=False,
+                    out_type="numpy",
+                )
+
+                for j in range(stop - start):
+                    tau_j = np.squeeze(tau[j, :, :, :, :])
+                    valid = np.isfinite(tau_j) & (tau_j >= 0)
+
+                    if not np.any(valid):
+                        continue
+
+                    h_j = np.squeeze(h_raw[j, :, :, :, :, :])
+                    pwr = float(np.mean(np.abs(h_j) ** 2))
+                    if np.isfinite(pwr) and pwr > 0:
+                        wb_flat[start + j] = float(-10.0 * np.log10(pwr))
+
+                print(f"[RTDBG] finished batch {start}:{stop} / {rx_coords.shape[0]}")
+
+            finally:
+                for name in temp_names:
+                    try:
+                        self.scene.remove(name)
+                    except Exception:
+                        pass
+
+        wb_khw = wb_flat.reshape(K, H, W)
+
+        # --- dump plots ---
+        txx = (tx_pos_xyz[0] - x0) / scale_m
+        txy = (tx_pos_xyz[1] - y0) / scale_m
+
+        for k in range(K):
+            plt.figure(figsize=(6, 5))
+            im = plt.imshow(wb_khw[k], origin="lower")
+            plt.colorbar(im, label="Ray-traced wideband loss (dB)")
+
+            if walls_khw is not None:
+                plt.contour(
+                    walls_khw[k],
+                    levels=[0.5],
+                    colors="white",
+                    linewidths=0.8,
+                    origin="lower",
+                )
+
+            plt.scatter([txx], [txy], c="red", s=30, marker="x", label="TX")
+            plt.legend(loc="upper right")
+            plt.title(
+                f"{prefix} WB loss slice k={k} "
+                f"TX=({tx_pos_xyz[0]:.2f},{tx_pos_xyz[1]:.2f},{tx_pos_xyz[2]:.2f})"
+            )
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(
+                    out_dir,
+                    f"{prefix}_tx_{tx_pos_xyz[0]:.2f}_{tx_pos_xyz[1]:.2f}_{tx_pos_xyz[2]:.2f}_k{k}.png",
+                ),
+                dpi=150,
+            )
+            plt.close()
+
+        print(f"[RTDBG] saved RT debug maps to: {out_dir}")
 
     def _compute_cfr_via_position(self, req_sim_time, tx_node, rx_node, req_mode):
         '''
@@ -2087,6 +2280,28 @@ class SionnaEnv:
             tx_pos = np.array(self.node_info[tx_node].pos, dtype=np.float64)
             rx_pos = np.array(self.node_info[curr_rx_node].pos, dtype=np.float64)
             d_m = float(np.linalg.norm(tx_pos - rx_pos))
+
+            # ###DEBUGGING###
+            # if not hasattr(self, "_rt_debug_dumped"):
+            #     self._rt_debug_dumped = set()
+
+            # tx_key = tuple(np.round(tx_pos.astype(np.float32), 3).tolist())
+            # if tx_key not in self._rt_debug_dumped:
+            #     self._dump_rt_debug_png(
+            #         tx_pos_xyz=tx_pos.astype(np.float32),
+            #         out_dir="debug_wb_rt",
+            #         prefix="rt_full",
+            #         batch_size=256,   # try 256 first
+            #         scale_m=0.625,
+            #         K=4,
+            #         H=64,
+            #         W=64,
+            #         z_step_cells=1.0,
+            #         z_margin_m=0.625 * 0.5,
+            #         origin_xy_mode="bbox_min",
+            #     )
+            #     self._rt_debug_dumped.add(tx_key)
+            # ###DEBUG DUMP#
 
             ##Friis for comparison###
             friis_loss_db = fspl_db(d_m, self.fc)
