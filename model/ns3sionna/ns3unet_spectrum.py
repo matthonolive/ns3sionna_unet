@@ -162,6 +162,33 @@ class UNetTdlPropagator:
 
         self._base_scene = MlinkScene.from_sionna(sionna_scene)
 
+        print("\n[MATDBG] extracted material_database:")
+        print(self._base_scene.material_database)
+
+        mi_scene = getattr(sionna_scene, "mi_scene", None)
+        if mi_scene is None:
+            mi_scene = getattr(sionna_scene, "_scene", None)
+
+        for i, shape in enumerate(mi_scene.shapes()):
+            params = mi.traverse(shape)
+            keys = sorted([k for k in params.keys() if "bsdf" in k])
+
+            def scalar(key):
+                if key not in params:
+                    return None
+                return float(np.asarray(params[key]).ravel()[0])
+
+            print(
+                f"[MATDBG] shape {i}: "
+                f"id={shape.id() if hasattr(shape, 'id') else '<no-id>'} "
+                f"has_eta={'bsdf.eta_r' in params} "
+                f"has_sigma={'bsdf.sigma' in params} "
+                f"eta_r={scalar('bsdf.eta_r')} "
+                f"sigma={scalar('bsdf.sigma')} "
+                f"d={scalar('bsdf.d')} "
+                f"keys={keys}"
+            )
+
         off = self.frequencies - self.fc_hz
         if (off[0] < 0) and (off[-1] > 0) and np.all(np.diff(off) > 0):
             self.fft_shift = True
@@ -356,7 +383,7 @@ class UNetTdlPropagator:
         self._cached_maps = maps
         self._cached_tx_key = key
 
-        # # DEBUG DUMP
+        # DEBUG DUMP
         # self._dump_wb_debug_png(
         #     maps=maps,
         #     tx_pos_xyz=tx_pos_xyz,
@@ -783,6 +810,32 @@ class Cost231Propagator:
         self.frequencies = np.asarray(frequencies_hz, dtype=np.float64)
 
         self._base_scene = MlinkScene.from_sionna(sionna_scene)
+        print("\n[MATDBG] extracted material_database:")
+        print(self._base_scene.material_database)
+
+        mi_scene = getattr(sionna_scene, "mi_scene", None)
+        if mi_scene is None:
+            mi_scene = getattr(sionna_scene, "_scene", None)
+
+        for i, shape in enumerate(mi_scene.shapes()):
+            params = mi.traverse(shape)
+            keys = sorted([k for k in params.keys() if "bsdf" in k])
+
+            def scalar(key):
+                if key not in params:
+                    return None
+                return float(np.asarray(params[key]).ravel()[0])
+
+            print(
+                f"[MATDBG] shape {i}: "
+                f"id={shape.id() if hasattr(shape, 'id') else '<no-id>'} "
+                f"has_eta={'bsdf.eta_r' in params} "
+                f"has_sigma={'bsdf.sigma' in params} "
+                f"eta_r={scalar('bsdf.eta_r')} "
+                f"sigma={scalar('bsdf.sigma')} "
+                f"d={scalar('bsdf.d')} "
+                f"keys={keys}"
+            )
 
         off = self.frequencies - self.fc_hz
         if (off[0] < 0) and (off[-1] > 0) and np.all(np.diff(off) > 0):
@@ -991,7 +1044,7 @@ class SionnaEnv:
     author: Pilz, Zubow
     """
     def __init__(self, model_folder='./models/', rt_fast=False, default_mode=MODE_P2P, rt_max_parallel_links=256, est_csi=True, 
-                 use_unet=False, unet_run="unet", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
+                 use_unet=False, unet_run="unet10int", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
                  VERBOSE=True,
                  CHECKS_ENABLED=True,
                  mobility_trace_in: str = "",
@@ -2579,7 +2632,7 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
 
     parser.add_argument("--use_unet", action="store_true", help="Use U-Net surrogate instead of Sionna ray tracing")
-    parser.add_argument("--unet_run", type=str, default="unet10int", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
+    parser.add_argument("--unet_run", type=str, default="unet10int_mixed", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
     parser.add_argument("--unet_device", type=str, default="cuda", help="cpu|cuda|cuda:0")
     parser.add_argument("--unet_no_path_wb", type=float, default=199.5, help="No-path sentinel wb_loss (dB)")
     parser.add_argument("--unet_y_wb_idx", type=int, default=0, help="Which output channel is delta_wb (dB)")
