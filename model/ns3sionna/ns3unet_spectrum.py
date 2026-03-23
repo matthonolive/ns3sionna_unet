@@ -383,15 +383,15 @@ class UNetTdlPropagator:
         self._cached_maps = maps
         self._cached_tx_key = key
 
-        # DEBUG DUMP
-        # self._dump_wb_debug_png(
-        #     maps=maps,
-        #     tx_pos_xyz=tx_pos_xyz,
-        #     origin_xyz=self._origin,
-        #     walls_khw=walls_khw,
-        #     out_dir="debug_wb_unet",
-        #     prefix="unet_full",
-        # )
+        # #DEBUG DUMP
+        self._dump_wb_debug_png(
+            maps=maps,
+            tx_pos_xyz=tx_pos_xyz,
+            origin_xyz=self._origin,
+            walls_khw=walls_khw,
+            out_dir="debug_wb_unet",
+            prefix="unet_full",
+        )
 
     # --- sampling + CFR synthesis stay the same as before ---
     def _trilerp(self, vol_khw: np.ndarray, kf: float, yf: float, xf: float) -> float:
@@ -2632,7 +2632,7 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
 
     parser.add_argument("--use_unet", action="store_true", help="Use U-Net surrogate instead of Sionna ray tracing")
-    parser.add_argument("--unet_run", type=str, default="unet10int_mixed", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
+    parser.add_argument("--unet_run", type=str, default="unet10int", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
     parser.add_argument("--unet_device", type=str, default="cuda", help="cpu|cuda|cuda:0")
     parser.add_argument("--unet_no_path_wb", type=float, default=199.5, help="No-path sentinel wb_loss (dB)")
     parser.add_argument("--unet_y_wb_idx", type=int, default=0, help="Which output channel is delta_wb (dB)")
