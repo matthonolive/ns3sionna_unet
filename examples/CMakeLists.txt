@@ -117,3 +117,9 @@ build_lib_example(
         SOURCE_FILES example-sionna-mobileflow_e.cc
         LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
 )
+
+build_lib_example(
+        NAME ns3sionna-example-sionna-sensing-mobile-trace
+        SOURCE_FILES example-sionna-sensing-mobile-trace.cc
+        LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
+)
