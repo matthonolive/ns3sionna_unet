@@ -120,6 +120,6 @@ build_lib_example(
 
 build_lib_example(
         NAME ns3sionna-example-sionna-sensing-mobile-trace
-        SOURCE_FILES example-sionna-sensing-mobile-trace.cc
+        SOURCE_FILES example-sionna-sensing-mobile_trace.cc
         LIBRARIES_TO_LINK ${libsionna} ${libwifi} ${libspectrum} ${libapplications} ${libinternet} ${libmobility} ${libnetwork} ${libcore} ${libpropagation} ${libstats} ${libflow-monitor}  
 )
