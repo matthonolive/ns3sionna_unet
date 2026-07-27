@@ -14,7 +14,7 @@ import bisect
 from common import message_pb2
 from common.message_debug import *
 
-from collections import deque
+from collections import deque, OrderedDict
 import warnings
 
 import tensorflow as tf
@@ -44,7 +44,8 @@ import torch
 from dataclasses import replace
 
 from mlink.antenna import AntennaGrid, AntennaDatabase
-from mlink.feature import build_feature_tensor
+from mlink.feature import build_feature_tensor, REGISTRY, Specification
+from trimesh.intersections import mesh_plane
 from mlink.geometry import generate_wall_map, walls_to_mesh
 from mlink.scene import Scene as MlinkScene
 from mlink.channel_tdl import RtCfg, subcarrier_frequencies_centered, compute_tdl_batch
@@ -53,6 +54,73 @@ from mlink.channel_tdl import RtCfg, subcarrier_frequencies_centered, compute_td
 from mobility import *
 
 from time import perf_counter
+
+
+# ==================================================================
+# Feature patch: bounds-safe binary_walls (required for tiling scenes)
+# ==================================================================
+# Identical to the rasterizer used for the offpatch training store
+# (train_delta_tau.py / offpatch_finetune.py). The stock mlink feature
+# indexes rasterized wall segments into the RX grid without clipping;
+# when a 64x64 patch sits inside a larger scene, wall segments extend
+# beyond the patch and the indices overflow (IndexError). This version
+# DROPS out-of-bounds points (walls outside the patch don't appear --
+# matching what the model saw in training) and is a behavioral no-op
+# for in-patch geometry, so it is registered globally.
+def binary_walls_offpatch(scene, frequency: float) -> np.ndarray:
+    mesh = scene.mesh
+    z_normal = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+
+    rx_grid = scene.antenna_database.rx_grid
+    if rx_grid is None:
+        raise Exception("Receivers must be initialized with a grid!")
+    K, H, W = rx_grid.shape
+
+    def rasterize_line(line_xyz: np.ndarray) -> np.ndarray:
+        src = np.asarray(rx_grid.xyz2ijk(line_xyz[0, :]), dtype=np.float32)
+        dst = np.asarray(rx_grid.xyz2ijk(line_xyz[1, :]), dtype=np.float32)
+        n = int(max(np.max(np.abs(dst - src)), 1)) + 1
+        pts = np.linspace(src, dst, num=n, endpoint=True).astype(np.int32)
+
+        keep = (
+            (pts[:, 0] >= 0) & (pts[:, 0] < H) &
+            (pts[:, 1] >= 0) & (pts[:, 1] < W)
+        )
+        pts = pts[keep]
+        if pts.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        return pts[:, :2]
+
+    wall_tensor_lst = []
+    for k in range(K):
+        plane_origin = rx_grid.origin + k * rx_grid.deltas[2]
+        lines = mesh_plane(
+            mesh,
+            plane_normal=z_normal,
+            plane_origin=plane_origin,
+            return_faces=False,
+        )
+
+        walls = np.zeros((H, W), dtype=np.float32)
+        if lines is not None and len(lines) > 0:
+            for line in lines:
+                ij = rasterize_line(np.asarray(line))
+                if ij.shape[0] > 0:
+                    walls[ij[:, 0], ij[:, 1]] = 1.0
+
+        wall_tensor_lst.append(walls)
+
+    wall_tensor = np.stack(wall_tensor_lst, axis=0).astype(np.float32)  # (K,H,W)
+    wall_maps = wall_tensor[None, None, :, :, :]
+    wall_maps = np.repeat(wall_maps, repeats=scene.antenna_database.tx_coords.shape[0], axis=0)
+    return wall_maps
+
+
+REGISTRY["binary_walls"] = Specification(
+    name="binary_walls",
+    requires=(),
+    fn=binary_walls_offpatch,
+)
 
 
 class UNetTdlPropagator:
@@ -100,6 +168,9 @@ class UNetTdlPropagator:
         no_path_wb: float = 199.5,
         fft_shift: bool = False,
         cov_thresh: float = 0.5,           # no-path threshold on coverage head
+        tx_cache_size: int = 256,          # LRU size for per-TX/(TX,patch) map cache
+        k_los_db: float = 6.0,             # Rician K for CFR synthesis (LOS)
+        k_nlos_db: float = 2.0,            # Rician K for CFR synthesis (NLOS)
         # ---- legacy kwargs: accepted and ignored ----
         y_wb_idx: int = None,
         y_excess_idx: int = None,
@@ -213,16 +284,28 @@ class UNetTdlPropagator:
         self._cost_off = None
         self._nobs_off = None
 
-        # cache per TX (single-patch mode)
-        self._cached_tx_key = None
-        self._cached_tx_pos = None
-        self._cached_maps = None       # (K, 3, H, W): [wb_db, tau_ns, cov]
+        # CFR synthesis K-factors (calibrated against RT; see validate_cfr)
+        self.k_los_db = float(k_los_db)
+        self.k_nlos_db = float(k_nlos_db)
 
-        # cache for tiling mode
-        self._cached_patch_key = None
-        self._cached_patch_origin = None  # (3,) float32
-        self._cached_patch_maps = None    # (K, 3, H, W)
-        self._cached_tile_tx_key = None   # TX key for tiled patches
+        # per-TX map cache. Keys are the TX position QUANTIZED to half a
+        # grid cell: features live on a scale_m grid, so sub-cell TX motion
+        # produces effectively identical inputs -- rebuilding for every
+        # millimeter of walker movement is what made mobile scenes slow.
+        # Reuse introduces at most a quarter-cell (~scale_m/4) TX position
+        # approximation, far below the grid resolution. A small LRU (not a
+        # single slot) prevents alternating TX nodes from evicting each
+        # other every request.
+        self.tx_cache_size = int(tx_cache_size)
+        self._tx_cache = OrderedDict()     # qkey -> (K,3,H,W) maps
+        self._patch_cache = OrderedDict()  # (qkey, patch_key) -> (origin, maps)
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+        # currently active state
+        self._cached_tx_key = None         # quantized key of current TX
+        self._cached_tx_pos = None
+        self._cached_maps = None           # (K, 3, H, W): [wb_db, tau_ns, cov]
 
     def attach_scene(self, sionna_scene, bbox, fc_hz: float, fft_size: int, subcarrier_spacing_hz: float, frequencies_hz: np.ndarray):
         self.fc_hz = float(fc_hz)
@@ -311,6 +394,29 @@ class UNetTdlPropagator:
         self._feat_counts = None
         self._cost_off = None
         self._nobs_off = None
+
+        # new scene -> old maps invalid
+        self._tx_cache.clear()
+        self._patch_cache.clear()
+        self._cached_tx_key = None
+        self._cached_maps = None
+
+    def _tx_qkey(self, p):
+        """TX position quantized to half a grid cell."""
+        q = self.scale_m * 0.5
+        v = np.asarray(p, dtype=np.float64).reshape(3)
+        return (int(round(v[0] / q)), int(round(v[1] / q)), int(round(v[2] / q)))
+
+    def _cache_stat(self, hit: bool):
+        if hit:
+            self._cache_hits += 1
+        else:
+            self._cache_misses += 1
+        n = self._cache_hits + self._cache_misses
+        if n % 200 == 0:
+            print(f"[UNet] tx-cache: hits={self._cache_hits} "
+                  f"misses={self._cache_misses} "
+                  f"({100.0 * self._cache_hits / n:.1f}% hit)", flush=True)
 
     # --------------------------------------------------------------
     # feature-offset bookkeeping (cost / num_obstructions extraction)
@@ -434,28 +540,31 @@ class UNetTdlPropagator:
         assert self._base_scene is not None, "call attach_scene() first"
 
         tx_pos_xyz = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
-        key = tuple(np.round(tx_pos_xyz, 3).tolist())
+        qkey = self._tx_qkey(tx_pos_xyz)
+        self._cached_tx_pos = tx_pos_xyz.copy()
+        self._cached_tx_key = qkey
 
         if self._needs_tiling:
-            # In tiling mode, we defer inference to sample_heads.
-            # Just store the TX position for later.
-            self._cached_tx_key = key
-            self._cached_tx_pos = tx_pos_xyz.copy()
-            # invalidate patch cache if TX changed
-            if self._cached_tile_tx_key != key:
-                self._cached_patch_key = None
-                self._cached_patch_maps = None
+            # tiling mode defers inference to sample_heads; the patch
+            # cache is keyed by (qkey, patch) so no invalidation is needed
             return
 
-        if key == self._cached_tx_key and self._cached_maps is not None:
+        maps = self._tx_cache.get(qkey)
+        if maps is not None:
+            self._tx_cache.move_to_end(qkey)
+            self._cached_maps = maps
+            self._cache_stat(hit=True)
             return
+        self._cache_stat(hit=False)
 
         adb = AntennaDatabase(tx_pos_xyz.reshape(1, 3), self._rx_coords, None, self._rx_grid)
         scene = replace(self._base_scene, antenna_database=adb)
 
-        self._cached_maps = self._predict_maps(scene)
-        self._cached_tx_key = key
-        self._cached_tx_pos = tx_pos_xyz.copy()
+        maps = self._predict_maps(scene)
+        self._tx_cache[qkey] = maps
+        while len(self._tx_cache) > self.tx_cache_size:
+            self._tx_cache.popitem(last=False)
+        self._cached_maps = maps
 
         # #DEBUG DUMP
         # self._dump_wb_debug_png(
@@ -510,10 +619,11 @@ class UNetTdlPropagator:
         adb = AntennaDatabase(tx_pos.reshape(1, 3), rx_coords, None, rx_grid)
         patch_scene = dc_replace(self._base_scene, antenna_database=adb)
 
-        self._cached_patch_maps = self._predict_maps(patch_scene)
-        self._cached_patch_key = patch_key
-        self._cached_patch_origin = patch_origin
-        self._cached_tile_tx_key = tuple(np.round(tx_pos, 3).tolist())
+        maps = self._predict_maps(patch_scene)
+        qkey = self._tx_qkey(tx_pos)
+        self._patch_cache[(qkey, patch_key)] = (patch_origin, maps)
+        while len(self._patch_cache) > self.tx_cache_size:
+            self._patch_cache.popitem(last=False)
 
     # --------------------------------------------------------------
     # sampling
@@ -562,20 +672,23 @@ class UNetTdlPropagator:
             kf = (rx[2] - z0) / self.z_step_m
             maps = self._cached_maps
         else:
-            # Tiling path: check if RX is in the current cached patch
+            # Tiling path: LRU keyed by (quantized TX, patch)
             patch_key = self._patch_key_for(rx)
-            tx_key = self._cached_tx_key
-
-            if (patch_key != self._cached_patch_key or
-                    tx_key != self._cached_tile_tx_key or
-                    self._cached_patch_maps is None):
+            ck = (self._cached_tx_key, patch_key)
+            entry = self._patch_cache.get(ck)
+            if entry is None:
+                self._cache_stat(hit=False)
                 self._run_patch(patch_key, self._cached_tx_pos, rx)
+                entry = self._patch_cache[ck]
+            else:
+                self._patch_cache.move_to_end(ck)
+                self._cache_stat(hit=True)
+            patch_origin, maps = entry
 
-            x0, y0, z0 = self._cached_patch_origin.tolist()
+            x0, y0, z0 = patch_origin.tolist()
             xf = (rx[0] - x0) / self.scale_m
             yf = (rx[1] - y0) / self.scale_m
             kf = (rx[2] - z0) / self.z_step_m
-            maps = self._cached_patch_maps
 
         if (xf < 0 or xf > self.W-1 or yf < 0 or yf > self.H-1 or kf < 0 or kf > self.K-1):
             print(f"[warn] RX outside grid -> clamping: xf={xf:.2f}, yf={yf:.2f}, kf={kf:.2f}, rx={rx}")
@@ -688,7 +801,7 @@ class UNetTdlPropagator:
 
         los = is_los_mi(mi_scene, tx_xyz, rx_xyz)
 
-        K_db = 15.0 if los else 5.0
+        K_db = self.k_los_db if los else self.k_nlos_db
         
         N = self.fft_size
         df = self.subcarrier_spacing_hz
@@ -912,7 +1025,7 @@ class Cost231Propagator:
     def __init__(self, scale_m=0.625, K=4, H=64, W=64, z_step_cells=1.0,
                  z_margin_m=0.3125, origin_xy_mode="bbox_min",
                  dataset_features=None, no_path_wb=199.5, fft_shift=False,
-                 default_tau_rms_ns=5.0):
+                 default_tau_rms_ns=5.0, k_los_db=6.0, k_nlos_db=2.0):
         self.scale_m = float(scale_m)
         self.H, self.W, self.K = int(H), int(W), int(K)
         self.z_step_m = float(scale_m * z_step_cells)
@@ -921,6 +1034,8 @@ class Cost231Propagator:
         self.no_path_wb = float(no_path_wb)
         self.fft_shift = bool(fft_shift)
         self.default_tau_rms_ns = float(default_tau_rms_ns)
+        self.k_los_db = float(k_los_db)
+        self.k_nlos_db = float(k_nlos_db)
 
         if dataset_features is None:
             dataset_features = ["cost"]
@@ -1119,7 +1234,7 @@ class Cost231Propagator:
 
         los = is_los_mi(mi_scene, tx_xyz, rx_xyz)
 
-        K_db = 15.0 if los else 5.0
+        K_db = self.k_los_db if los else self.k_nlos_db
         
         N = self.fft_size
         df = self.subcarrier_spacing_hz
@@ -1165,6 +1280,118 @@ class Cost231Propagator:
             H = np.fft.fftshift(H)
         return H
 
+class LogDistancePropagator:
+    """Log-distance path-loss baseline. Same interface as UNetTdlPropagator
+    but purely analytic and geometry-blind (no walls):
+
+        PL(d) = PL(d0) + 10 * n * log10(d / d0)
+
+    with PL(d0) = FSPL(d0, fc). n = 2.0 recovers Friis; typical indoor
+    NLOS values are 3.0-4.0. Like COST-231, it has no delay information,
+    so tau_rms is a fixed default and excess delay is 0."""
+
+    def __init__(self, exponent=3.0, ref_dist_m=1.0, no_path_wb=199.5,
+                 fft_shift=False, default_tau_rms_ns=5.0,
+                 k_los_db=6.0, k_nlos_db=2.0):
+        self.exponent = float(exponent)
+        self.ref_dist_m = max(float(ref_dist_m), 1e-3)
+        self.no_path_wb = float(no_path_wb)
+        self.fft_shift = bool(fft_shift)
+        self.default_tau_rms_ns = float(default_tau_rms_ns)
+        self.k_los_db = float(k_los_db)
+        self.k_nlos_db = float(k_nlos_db)
+        self._cached_tx_pos = None
+
+    def attach_scene(self, sionna_scene, bbox, fc_hz, fft_size,
+                     subcarrier_spacing_hz, frequencies_hz):
+        self.fc_hz = float(fc_hz)
+        self.fft_size = int(fft_size)
+        self.subcarrier_spacing_hz = float(subcarrier_spacing_hz)
+        self.frequencies = np.asarray(frequencies_hz, dtype=np.float64)
+
+        off = self.frequencies - self.fc_hz
+        if (off[0] < 0) and (off[-1] > 0) and np.all(np.diff(off) > 0):
+            self.fft_shift = True
+        else:
+            self.fft_shift = False
+
+        lam = 299792458.0 / self.fc_hz
+        self._pl0_db = 20.0 * np.log10(4.0 * np.pi * self.ref_dist_m / lam)
+        print(f"[LogDist] n={self.exponent}, d0={self.ref_dist_m} m, "
+              f"PL(d0)={self._pl0_db:.2f} dB")
+
+    def predict_for_tx(self, tx_pos_xyz):
+        self._cached_tx_pos = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
+
+    def sample_heads(self, rx_pos_xyz):
+        assert self._cached_tx_pos is not None, "call predict_for_tx() first"
+        rx = np.asarray(rx_pos_xyz, dtype=np.float32).reshape(3)
+        d = max(float(np.linalg.norm(rx - self._cached_tx_pos)), self.ref_dist_m)
+        wb_db = self._pl0_db + 10.0 * self.exponent * np.log10(d / self.ref_dist_m)
+        return float(wb_db), float(self.default_tau_rms_ns), 0.0
+
+    def synthesize_cfr(self, tau_rms_ns: float, mi_scene, tx_xyz, rx_xyz,
+                       seed: int, synthetic=False) -> np.ndarray:
+        # identical synthesis model to the other surrogates so CFR
+        # differences reflect only tau/wb, not the generator
+        if not synthetic:
+            H = np.ones(self.fft_size, dtype=np.complex64)
+            if self.fft_shift:
+                H = np.fft.fftshift(H)
+            return H
+
+        def is_los_mi(mi_scene, tx_xyz, rx_xyz, eps=1e-2):
+            tx = np.asarray(tx_xyz, dtype=np.float32)
+            rx = np.asarray(rx_xyz, dtype=np.float32)
+            dvec = rx - tx
+            dist = float(np.linalg.norm(dvec))
+            if dist < 1e-6:
+                return True
+            direction = dvec / dist
+            o = mi.Point3f(tx + eps * direction)
+            d = mi.Vector3f(direction)
+            ray = mi.Ray3f(o, d)
+            ray.maxt = mi.Float(max(dist - 2 * eps, 0.0))
+            si = mi_scene.ray_intersect(ray, mi.RayFlags.Minimal, False, True)
+            return not bool(si.is_valid())
+
+        los = is_los_mi(mi_scene, tx_xyz, rx_xyz) if mi_scene is not None else True
+        K_db = self.k_los_db if los else self.k_nlos_db
+
+        N = self.fft_size
+        df = self.subcarrier_spacing_hz
+        Ts = 1.0 / (N * df)
+        tau_rms = max(float(tau_rms_ns), 1e-3) * 1e-9
+
+        K_lin = 10.0 ** (float(K_db) / 10.0)
+        if K_lin > 0.0:
+            p_spec = K_lin / (K_lin + 1.0)
+            p_diff = 1.0 / (K_lin + 1.0)
+            tau_d = tau_rms * (K_lin + 1.0) / np.sqrt(2.0 * K_lin + 1.0)
+        else:
+            p_spec = 0.0
+            p_diff = 1.0
+            tau_d = tau_rms
+
+        L = int(np.clip(np.ceil(6.0 * tau_d / Ts), 1, N))
+        t = np.arange(L, dtype=np.float64) * Ts
+        p = np.exp(-t / max(tau_d, 1e-12))
+        p = p / (p.sum() + 1e-12)
+
+        rng = np.random.default_rng(seed)
+        w = (rng.standard_normal(L) + 1j * rng.standard_normal(L)) * np.sqrt(0.5)
+        taps = w * np.sqrt(p_diff * p)
+        if p_spec > 0.0:
+            phi = rng.uniform(0.0, 2.0 * np.pi)
+            taps[0] += np.sqrt(p_spec) * np.exp(1j * phi)
+
+        H = np.fft.fft(taps, n=N).astype(np.complex64)
+        H = H / np.sqrt(np.mean(np.abs(H) ** 2) + 1e-12)
+        if self.fft_shift:
+            H = np.fft.fftshift(H)
+        return H
+
+
 class SionnaEnv:
 
     # just compute the given single point-to-point channel
@@ -1182,11 +1409,15 @@ class SionnaEnv:
     """
     def __init__(self, model_folder='./models/', rt_fast=False, default_mode=MODE_P2P, rt_max_parallel_links=256, est_csi=True, 
                  use_unet=False, unet_run="unet10int", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
-                 unet_cov_thresh=0.5,
+                 unet_cov_thresh=0.5, unet_tx_cache=256,
                  VERBOSE=True,
                  CHECKS_ENABLED=True,
                  mobility_trace_in: str = "",
-                 use_cost231=False, cost231_tau_rms_ns=5.0):
+                 use_cost231=False, cost231_tau_rms_ns=5.0,
+                 use_logdist=False, logdist_exponent=3.0, logdist_ref_m=1.0,
+                 logdist_tau_rms_ns=5.0,
+                 synthetic_cfr=False,
+                 cfr_k_los_db=6.0, cfr_k_nlos_db=2.0):
         self.model_folder = model_folder
         self.rt_fast = rt_fast
         if rt_fast:
@@ -1232,6 +1463,7 @@ class SionnaEnv:
         self.unet_y_tau_rms_idx = unet_y_tau_rms_idx
         self.unet_y_excess_idx = unet_y_excess_idx
         self.unet_cov_thresh = float(unet_cov_thresh)
+        self.unet_tx_cache = int(unet_tx_cache)
         self._unet = None
 
         if not self.use_unet:
@@ -1241,6 +1473,19 @@ class SionnaEnv:
         self.use_cost231 = use_cost231
         self.cost231_tau_rms_ns = cost231_tau_rms_ns
         self._cost231 = None
+
+        # log-distance baseline
+        self.use_logdist = use_logdist
+        self.logdist_exponent = float(logdist_exponent)
+        self.logdist_ref_m = float(logdist_ref_m)
+        self.logdist_tau_rms_ns = float(logdist_tau_rms_ns)
+        self._logdist = None
+
+        # send synthetic (tau-shaped Rician) CFRs instead of flat ones;
+        # needed for CFR-level validation against RT
+        self.synthetic_cfr = bool(synthetic_cfr)
+        self.cfr_k_los_db = float(cfr_k_los_db)
+        self.cfr_k_nlos_db = float(cfr_k_nlos_db)
 
         self.VERBOSE = VERBOSE
         self.CHECKS_ENABLED = CHECKS_ENABLED
@@ -1349,6 +1594,9 @@ class SionnaEnv:
                     device=self.unet_device,
                     no_path_wb=self.unet_no_path_wb,
                     cov_thresh=self.unet_cov_thresh,
+                    tx_cache_size=self.unet_tx_cache,
+                    k_los_db=self.cfr_k_los_db,
+                    k_nlos_db=self.cfr_k_nlos_db,
                     # IMPORTANT: set these to match train_delta_tau CFG
                     scale_m=0.625,
                     z_step_cells=1.0,
@@ -1365,8 +1613,21 @@ class SionnaEnv:
                     z_margin_m=0.625 * 0.5,
                     origin_xy_mode="bbox_min",
                     default_tau_rms_ns=self.cost231_tau_rms_ns,
+                    k_los_db=self.cfr_k_los_db,
+                    k_nlos_db=self.cfr_k_nlos_db,
                 )
             self._cost231.attach_scene(self.scene, self.bbox, self.fc, self.fft_size, self.subcarrier_spacing, self.frequencies)
+
+        elif self.use_logdist:
+            if self._logdist is None:
+                self._logdist = LogDistancePropagator(
+                    exponent=self.logdist_exponent,
+                    ref_dist_m=self.logdist_ref_m,
+                    default_tau_rms_ns=self.logdist_tau_rms_ns,
+                    k_los_db=self.cfr_k_los_db,
+                    k_nlos_db=self.cfr_k_nlos_db,
+                )
+            self._logdist.attach_scene(self.scene, self.bbox, self.fc, self.fft_size, self.subcarrier_spacing, self.frequencies)
 
         # configure mobility models
         self._init_mobility(sim_init_msg)
@@ -1523,6 +1784,19 @@ class SionnaEnv:
                 no_path_wb=self._cost231.no_path_wb,
                 is_delta=False,
                 label="COST231-LAH",
+            )
+
+        elif self.use_logdist:
+
+            return self._compute_cfr_with_lookahead_surrogate(
+                lah_time_vec=lah_time_vec,
+                tx_node_id=tx_node_id,
+                rx_nodes=rx_nodes,
+                reply_wrapper=reply_wrapper,
+                propagator=self._logdist,
+                no_path_wb=self._logdist.no_path_wb,
+                is_delta=False,
+                label="LOGDIST-LAH",
             )
 
         self._place_tx_rx_nodes_with_lah(lah_time_vec, tx_node_id, rx_nodes)
@@ -1710,7 +1984,7 @@ class SionnaEnv:
                             ^ (int(curr_rx_node) * 97531)
                             ^ (int(lah_time) & 0xFFFFFFFF)
                         )
-                        h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed)
+                        h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed, synthetic=self.synthetic_cfr)
                         # mag_db = 20*np.log10(np.abs(h_norm) + 1e-12)
                         # print("ripple_pp_dB=", float(mag_db.max() - mag_db.min()),
                         #     "ripple_std_dB=", float(mag_db.std()))
@@ -1818,6 +2092,7 @@ class SionnaEnv:
                         h_norm = propagator.synthesize_cfr(
                             tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene,
                             tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed,
+                            synthetic=self.synthetic_cfr,
                         )
                         rx_node_info.frequencies.extend(freqs_list)
                         rx_node_info.csi_imag.extend(np.imag(h_norm).tolist())
@@ -2357,7 +2632,7 @@ class SionnaEnv:
                     f"tau_rms={tau_rms_ns:.4f} ns"
                 )
                 
-                h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed)
+                h_norm = self._unet.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed, synthetic=self.synthetic_cfr)
 
                 # sanity: mean |H|^2 ~ 1
                 if self.CHECKS_ENABLED:
@@ -2401,7 +2676,7 @@ class SionnaEnv:
 
                 if self.est_csi:
                     seed = (int(self.my_seed) * 1315423911) ^ (int(tx_node) * 2654435761) ^ (int(curr_rx_node) * 97531) ^ (int(self.sim_time) & 0xffffffff)
-                    h_norm = self._cost231.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed)
+                    h_norm = self._cost231.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed, synthetic=self.synthetic_cfr)
                     h_normalized_arr.append(h_norm)
                 else:
                     h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
@@ -2418,6 +2693,40 @@ class SionnaEnv:
 
             t_total = perf_counter() - t0
             print(f"[TIM] cost231 total={1e3*t_total:.2f} ms", flush=True)
+
+            return rx_nodes, lnk_delay_arr, lnk_loss_arr, h_normalized_arr
+
+        elif self.use_logdist:
+            t0 = perf_counter()
+            tx_pos = np.array(self.node_info[tx_node].pos, dtype=np.float32)
+
+            self._logdist.predict_for_tx(tx_pos)
+
+            lnk_delay_arr = []
+            lnk_loss_arr = []
+            h_normalized_arr = []
+
+            for curr_rx_node in rx_nodes:
+                rx_pos = np.array(self.node_info[curr_rx_node].pos, dtype=np.float32)
+
+                wb_db, tau_rms_ns, excess_ns = self._logdist.sample_heads(rx_pos)
+                d_m = float(np.linalg.norm(tx_pos - rx_pos))
+
+                base_ns = d_m / 299792458.0 * 1e9
+                lnk_delay_arr.append(int(round(base_ns)))
+                lnk_loss_arr.append(float(wb_db))
+
+                if self.est_csi:
+                    seed = (int(self.my_seed) * 1315423911) ^ (int(tx_node) * 2654435761) ^ (int(curr_rx_node) * 97531) ^ (int(self.sim_time) & 0xffffffff)
+                    h_norm = self._logdist.synthesize_cfr(tau_rms_ns=tau_rms_ns, mi_scene=self.scene.mi_scene, tx_xyz=tx_pos, rx_xyz=rx_pos, seed=seed, synthetic=self.synthetic_cfr)
+                    h_normalized_arr.append(h_norm)
+                else:
+                    h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
+
+                print(f"[LOGDIST] tx={tx_node} rx={curr_rx_node} d={d_m:.3f} m wb={wb_db:.1f} dB delay={int(round(base_ns))} ns")
+
+            t_total = perf_counter() - t0
+            print(f"[TIM] logdist total={1e3*t_total:.2f} ms", flush=True)
 
             return rx_nodes, lnk_delay_arr, lnk_loss_arr, h_normalized_arr
 
@@ -2777,10 +3086,11 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
 
     parser.add_argument("--use_unet", action="store_true", help="Use U-Net surrogate instead of Sionna ray tracing")
-    parser.add_argument("--unet_run", type=str, default="unet_shannon", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
+    parser.add_argument("--unet_run", type=str, default="unet10int_mixed_hard", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
     parser.add_argument("--unet_device", type=str, default="cuda", help="cpu|cuda|cuda:0")
     parser.add_argument("--unet_no_path_wb", type=float, default=199.5, help="No-path sentinel wb_loss (dB)")
     parser.add_argument("--unet_cov_thresh", type=float, default=0.5, help="Coverage-probability threshold below which a link is declared no-path")
+    parser.add_argument("--unet_tx_cache", type=int, default=256, help="LRU entries for cached UNet maps (per TX, or per (TX,patch) when tiling); ~200 KB each. Size it >= n_static_tx * patches_per_scene")
     parser.add_argument("--unet_y_wb_idx", type=int, default=0, help="DEPRECATED (ignored): residual model has fixed head layout [r, tau, coverage_logit]")
     parser.add_argument("--unet_y_tau_rms_idx", type=int, default=2, help="DEPRECATED (ignored): residual model has fixed head layout")
     parser.add_argument("--unet_y_excess_idx", type=int, default=-1, help="DEPRECATED (ignored): residual model has no excess-delay head")
@@ -2788,6 +3098,13 @@ if __name__ == '__main__':
                     help="CSV with t_s,node,x,y,z,... used to drive mobility deterministically")
     parser.add_argument("--use_cost231", action="store_true", help="Use COST-231 multi-wall model (no RT, no UNet)")
     parser.add_argument("--cost231_tau_rms_ns", type=float, default=5.0, help="Default tau_rms (ns) for COST-231 CFR synthesis")
+    parser.add_argument("--use_logdist", action="store_true", help="Use log-distance path-loss baseline (no RT, no UNet, no walls)")
+    parser.add_argument("--logdist_exponent", type=float, default=3.0, help="Log-distance path-loss exponent n (2.0 = Friis)")
+    parser.add_argument("--logdist_ref_m", type=float, default=1.0, help="Log-distance reference distance d0 (m)")
+    parser.add_argument("--logdist_tau_rms_ns", type=float, default=5.0, help="Default tau_rms (ns) for log-distance CFR synthesis")
+    parser.add_argument("--synthetic_cfr", action="store_true", help="Send synthetic tau-shaped Rician CFRs from surrogates instead of flat CFRs (for CFR-level validation)")
+    parser.add_argument("--cfr_k_los_db", type=float, default=6.0, help="Rician K (dB) for synthetic CFRs on LOS links (RT-calibrated default)")
+    parser.add_argument("--cfr_k_nlos_db", type=float, default=2.0, help="Rician K (dB) for synthetic CFRs on NLOS links (RT-calibrated default)")
     args = parser.parse_args()
 
     print("ns3sionna v1.0")
@@ -2799,10 +3116,18 @@ if __name__ == '__main__':
                         args.est_csi, args.use_unet, args.unet_run, args.unet_device, args.unet_no_path_wb,
                         args.unet_y_wb_idx,  args.unet_y_tau_rms_idx, args.unet_y_excess_idx,
                         unet_cov_thresh=args.unet_cov_thresh,
+                        unet_tx_cache=args.unet_tx_cache,
                         VERBOSE=args.verbose,
                         mobility_trace_in=args.mobility_trace_in,
                         use_cost231=args.use_cost231,
-                        cost231_tau_rms_ns=args.cost231_tau_rms_ns)
+                        cost231_tau_rms_ns=args.cost231_tau_rms_ns,
+                        use_logdist=args.use_logdist,
+                        logdist_exponent=args.logdist_exponent,
+                        logdist_ref_m=args.logdist_ref_m,
+                        logdist_tau_rms_ns=args.logdist_tau_rms_ns,
+                        synthetic_cfr=args.synthetic_cfr,
+                        cfr_k_los_db=args.cfr_k_los_db,
+                        cfr_k_nlos_db=args.cfr_k_nlos_db)
         env.run()
 
         if args.single_run:
