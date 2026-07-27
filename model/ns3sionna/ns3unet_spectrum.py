@@ -54,12 +54,41 @@ from mobility import *
 
 from time import perf_counter
 
+
 class UNetTdlPropagator:
+    """Residual-over-cost U-Net propagator (train_delta_tau.py checkpoints).
+
+    Model contract (must match training exactly):
+        head layout (3 per slice): [r, tau, coverage_logit]
+        r    = pred[:,0] * r_std + r_mean            (clipped to +-r_clip_db)
+        r    = 0 where num_obstructions < nobs_los_thresh       (LOS gate)
+        wb   = wb_cost + r,  wb_cost = -cost feature (cost is stored as
+               NEGATIVE path loss in the feature tensor)
+        tau  = inv_tau_target( pred[:,1] * tau_std + tau_mean ), >= 0
+        cov  = sigmoid(pred[:,2])   -- raw logit, NOT affine-unnormalized
+
+    Differences vs. the legacy (delta-over-Friis) propagator:
+      * sample_heads() returns the FULL wideband loss (dB). Callers must
+        NOT add FSPL to it.
+      * excess-delay head no longer exists; excess_ns is always None.
+      * Cached maps are (K, 3, H, W) = [wb_db, tau_ns, cov_prob], physical
+        units, CONTINUOUS wb (no sentinel written into the map). No-path
+        is decided from the interpolated coverage probability AFTER
+        trilinear interpolation, so sentinel values never bleed into
+        neighboring finite samples.
+      * cost and num_obstructions are REQUIRED input features.
+      * Legacy kwargs (y_wb_idx / y_excess_idx / y_tau_rms_idx) are
+        accepted and ignored so old call sites keep working.
+    """
+
+    # model output channel layout (matches train_delta_tau.py)
+    P_R, P_TAU, P_COV = 0, 1, 2
+
     def __init__(
         self,
         run_dir: str,
         device: str = "cuda",
-        # MUST match training_tdl.py grid params
+        # MUST match training grid params
         scale_m: float = 0.625,
         K: int = 4,
         H: int = 64,
@@ -68,20 +97,38 @@ class UNetTdlPropagator:
         z_margin_m: float = 0.3125,  # e.g., 0.5 cell * 0.625m
         origin_xy_mode: str = "bbox_min",  # "bbox_min" or "zero"
         dataset_features=None,
-        y_wb_idx: int = 0,
-        y_excess_idx: int = 1,
-        y_tau_rms_idx: int = 2,
         no_path_wb: float = 199.5,
         fft_shift: bool = False,
+        cov_thresh: float = 0.5,           # no-path threshold on coverage head
+        # ---- legacy kwargs: accepted and ignored ----
+        y_wb_idx: int = None,
+        y_excess_idx: int = None,
+        y_tau_rms_idx: int = None,
     ):
+        if any(v is not None for v in (y_wb_idx, y_excess_idx, y_tau_rms_idx)):
+            warnings.warn(
+                "[UNet] y_wb_idx / y_excess_idx / y_tau_rms_idx are ignored: "
+                "the residual-over-cost model has a fixed head layout "
+                "[r, tau, coverage_logit].")
+
         run = Path(run_dir)
         self.meta = json.loads((run / "meta.json").read_text())
         stats = np.load(run / "norm_stats.npz")
 
+        # ---- refuse to run a checkpoint this class doesn't understand ----
+        param = self.meta.get("parametrization", None)
+        if param != "residual_over_cost":
+            raise RuntimeError(
+                f"UNetTdlPropagator (residual version) got parametrization="
+                f"{param!r}. This class only supports 'residual_over_cost' "
+                f"checkpoints from train_delta_tau.py. For legacy "
+                f"delta-over-Friis checkpoints, use the previous version of "
+                f"this file.")
+
         self.device = torch.device(device)
         self.model = torch.jit.load(str(run / "model.pt"), map_location=self.device).eval()
 
-        # grid sizes (use meta if present, else fall back)
+        # ---- grid sizes (use meta if present, else fall back) ----
         self.H = int(self.meta.get("H", H))
         self.W = int(self.meta.get("W", W))
         self.K = int(self.meta.get("K", K))
@@ -90,42 +137,61 @@ class UNetTdlPropagator:
         self.z_margin_m = float(z_margin_m)
         self.origin_xy_mode = origin_xy_mode
 
-        # features (must match what you trained with)
-        if dataset_features is None:
-            dataset_features = self.meta.get("dataset_features", ["binary_walls", "electrical_distance", "cost", "height_cond"])
-        self.dataset_features = list(dataset_features)
+        # ---- head layout ----
+        self.y_ch = int(self.meta.get("y_ch", 3))
+        if self.y_ch != 3:
+            raise RuntimeError(
+                f"meta.json reports y_ch={self.y_ch}, expected 3 "
+                f"([r, tau, coverage_logit]) for residual_over_cost.")
 
-        # heads
-        self.y_wb_idx = int(y_wb_idx)
-        self.y_excess_idx = int(y_excess_idx)
-        self.y_tau_rms_idx = int(y_tau_rms_idx)
-        self.no_path_wb = float(no_path_wb)
+        # ---- features (must match what you trained with) ----
+        if dataset_features is None:
+            dataset_features = self.meta.get("dataset_features", [
+                "binary_walls", "electrical_distance", "cost",
+                "num_obstructions", "height_cond"])
+        self.dataset_features = list(dataset_features)
+        for req in ("cost", "num_obstructions"):
+            if req not in self.dataset_features:
+                raise RuntimeError(
+                    f"Feature '{req}' is required to reconstruct "
+                    f"wb = wb_cost + r with the LOS gate, but is missing "
+                    f"from dataset_features={self.dataset_features}.")
+
+        # ---- physics / thresholds ----
+        self.no_path_wb = float(self.meta.get("no_path_wb_db", no_path_wb))
+        self.cov_thresh = float(cov_thresh)
+        self.los_gate_residual = bool(self.meta.get("los_gate_residual", True))
+        self.nobs_los_thresh = float(self.meta.get("nobs_los_thresh", 0.5))
+        self.r_clip_db = float(self.meta.get("r_clip_db", 60.0))
+        self.tau_target = str(self.meta.get("tau_target", "raw"))
+        self.tau_log_eps_ns = float(self.meta.get("tau_log_eps_ns", 1e-3))
         self.fft_shift = bool(fft_shift)
 
-        # --- Load stats; coerce to (C,1,1) and (Y,1,1) ---
-        x_mean = stats["x_mean"]
-        x_std  = stats["x_std"]
-        y_mean = stats["y_mean"]
-        y_std  = stats["y_std"]
-
+        # ---- normalization stats ----
         def to_c11(a):
             a = np.asarray(a)
             if a.ndim == 1:
                 a = a[:, None, None]
             return a
 
-        x_mean = to_c11(x_mean)
-        x_std  = to_c11(x_std)
-        y_mean = to_c11(y_mean)
-        y_std  = to_c11(y_std)
+        for key in ("x_mean", "x_std", "r_mean", "r_std", "tau_mean", "tau_std"):
+            if key not in stats.files:
+                raise RuntimeError(
+                    f"norm_stats.npz is missing '{key}'. This does not look "
+                    f"like a residual_over_cost checkpoint "
+                    f"(found keys: {list(stats.files)}).")
 
+        x_mean = to_c11(stats["x_mean"])
+        x_std = to_c11(stats["x_std"])
         self.C_model = int(x_mean.shape[0])
-        self.Y_model = int(y_mean.shape[0])
+        self.Y_model = self.K * self.y_ch
 
         self.x_mean = torch.from_numpy(x_mean).float().to(self.device)
-        self.x_std  = torch.from_numpy(x_std).float().to(self.device).clamp_min(1e-6)
-        self.y_mean = torch.from_numpy(y_mean).float().to(self.device)
-        self.y_std  = torch.from_numpy(y_std).float().to(self.device).clamp_min(1e-6)
+        self.x_std = torch.from_numpy(x_std).float().to(self.device).clamp_min(1e-6)
+        self.r_mean = float(stats["r_mean"])
+        self.r_std = max(float(stats["r_std"]), 1e-6)
+        self.tau_mean = float(stats["tau_mean"])
+        self.tau_std = max(float(stats["tau_std"]), 1e-6)
 
         self.keep_idx = None
         if "keep_idx" in stats.files:
@@ -133,7 +199,7 @@ class UNetTdlPropagator:
             if ki is not None and np.size(ki) > 0:
                 self.keep_idx = np.asarray(ki, dtype=np.int64)
 
-        # set later
+        # ---- set later by attach_scene ----
         self._base_scene = None
         self._rx_grid = None
         self._rx_coords = None
@@ -142,16 +208,20 @@ class UNetTdlPropagator:
         self._bbox_min_x = 0.0
         self._bbox_min_y = 0.0
 
-        # cache per TX
-        self._cached_tx_key = None
-        self._cached_maps = None  # (K,y_ch,H,W) float32
+        # per-feature channel counts (lazy, cached at first prediction)
+        self._feat_counts = None
+        self._cost_off = None
+        self._nobs_off = None
 
-        
+        # cache per TX (single-patch mode)
+        self._cached_tx_key = None
+        self._cached_tx_pos = None
+        self._cached_maps = None       # (K, 3, H, W): [wb_db, tau_ns, cov]
 
         # cache for tiling mode
         self._cached_patch_key = None
         self._cached_patch_origin = None  # (3,) float32
-        self._cached_patch_maps = None    # (K,y_ch,H,W) float32
+        self._cached_patch_maps = None    # (K, 3, H, W)
         self._cached_tile_tx_key = None   # TX key for tiled patches
 
     def attach_scene(self, sionna_scene, bbox, fc_hz: float, fft_size: int, subcarrier_spacing_hz: float, frequencies_hz: np.ndarray):
@@ -237,6 +307,165 @@ class UNetTdlPropagator:
         else:
             print(f"[UNet] Scene is {scene_cells_x}x{scene_cells_y} cells, fits in one patch -> tiling disabled")
 
+        # feature offsets depend only on the feature list; recompute lazily
+        self._feat_counts = None
+        self._cost_off = None
+        self._nobs_off = None
+
+    # --------------------------------------------------------------
+    # feature-offset bookkeeping (cost / num_obstructions extraction)
+    # --------------------------------------------------------------
+    def _ensure_feat_offsets(self, scene):
+        """Compute per-feature channel counts once (mirrors training's
+        infer_feature_channel_counts / feature_slice_offset). One-time
+        cost at the first prediction; cached afterwards."""
+        if self._cost_off is not None and self._nobs_off is not None:
+            return
+        counts = {}
+        for f in self.dataset_features:
+            xf = build_feature_tensor(scene, self.fc_hz, requested=[f]).astype(np.float32)
+            counts[f] = int(xf.shape[1])
+        self._feat_counts = counts
+
+        off = 0
+        offsets = {}
+        for f in self.dataset_features:
+            offsets[f] = off
+            off += counts[f]
+        self._cost_off = offsets["cost"]
+        self._nobs_off = offsets["num_obstructions"]
+        print(f"[UNet] feature channel counts: {counts} "
+              f"(cost_off={self._cost_off}, nobs_off={self._nobs_off})")
+
+    # --------------------------------------------------------------
+    # forward + physical reconstruction
+    # --------------------------------------------------------------
+    def _forward_normalized(self, x_chw: torch.Tensor) -> torch.Tensor:
+        """x_chw: (C_model, H, W) RAW features -> NORMALIZED model output
+        (K*3, H, W). No affine un-normalization here: the heads are mixed
+        (normalized r, normalized tau target, raw logit)."""
+        x_n = (x_chw - self.x_mean) / self.x_std
+        with torch.no_grad():
+            pred_n = self.model(x_n.unsqueeze(0)).squeeze(0)  # (Y_model,H,W)
+        return pred_n
+
+    def _tau_from_target(self, tau_t: np.ndarray) -> np.ndarray:
+        if self.tau_target == "log10":
+            tau = np.power(10.0, tau_t) - self.tau_log_eps_ns
+        else:
+            tau = tau_t
+        return np.maximum(tau, 0.0)
+
+    def _reconstruct_maps(self, pred_n: torch.Tensor, x_raw: np.ndarray) -> np.ndarray:
+        """pred_n: (K*3, H, W) normalized model output.
+        x_raw:  (1, c_in, K, H, W) RAW (un-normalized) feature tensor.
+        Returns (K, 3, H, W) physical maps [wb_db, tau_ns, cov_prob].
+        wb is CONTINUOUS (no sentinel); no-path is applied after interp."""
+        p = pred_n.detach().float().cpu().numpy().reshape(
+            self.K, self.y_ch, self.H, self.W)
+
+        cost = x_raw[0, self._cost_off]          # (K, H, W), negative PL
+        nobs = x_raw[0, self._nobs_off]          # (K, H, W)
+        wb_cost = -cost.astype(np.float32)
+
+        # residual head
+        r = p[:, self.P_R] * self.r_std + self.r_mean
+        r = np.clip(r, -self.r_clip_db, self.r_clip_db)
+        if self.los_gate_residual:
+            r[nobs < self.nobs_los_thresh] = 0.0
+
+        wb = (wb_cost + r).astype(np.float32)
+
+        # tau head
+        tau = self._tau_from_target(
+            p[:, self.P_TAU] * self.tau_std + self.tau_mean).astype(np.float32)
+
+        # coverage head: logit -> probability (numerically stable sigmoid)
+        z = p[:, self.P_COV]
+        cov = np.where(z >= 0.0,
+                       1.0 / (1.0 + np.exp(-np.abs(z))),
+                       np.exp(-np.abs(z)) / (1.0 + np.exp(-np.abs(z)))).astype(np.float32)
+        # LOS always has a path: mirror the training-time guarantee so the
+        # coverage head can never drop a true-LOS link
+        if self.los_gate_residual:
+            cov[nobs < self.nobs_los_thresh] = 1.0
+
+        return np.stack([wb, tau, cov], axis=1)   # (K, 3, H, W)
+
+    def _predict_maps(self, scene) -> np.ndarray:
+        """Common path for full-scene and patch inference."""
+        self._ensure_feat_offsets(scene)
+
+        # x: (1, c_in, K, H, W)
+        x = build_feature_tensor(scene, self.fc_hz, requested=self.dataset_features).astype(np.float32)
+        c_in = x.shape[1]
+
+        # stack: (1,c_in,K,H,W) -> (1,K*c_in,H,W)
+        x_stack = x.transpose(0, 2, 1, 3, 4).reshape(1, self.K * c_in, self.H, self.W)
+        x_chw = x_stack[0]  # (K*c_in,H,W)
+
+        if self.keep_idx is not None:
+            if self.keep_idx.size != self.C_model:
+                raise RuntimeError(
+                    f"keep_idx size={self.keep_idx.size} but model expects C_model={self.C_model}. "
+                    "Your norm_stats/model are inconsistent.")
+            x_chw = x_chw[self.keep_idx, :, :]
+
+        if x_chw.shape[0] != self.C_model:
+            raise RuntimeError(
+                f"UNet input channel mismatch: built {x_chw.shape[0]} channels "
+                f"(K={self.K}, c_in={c_in}) but model expects C_model={self.C_model} "
+                f"(from norm_stats.x_mean).")
+
+        x_t = torch.from_numpy(x_chw).to(self.device)
+        pred_n = self._forward_normalized(x_t)  # (Y_model,H,W) normalized
+
+        if int(pred_n.shape[0]) != self.Y_model:
+            raise RuntimeError(
+                f"UNet output channel mismatch: model outputs {int(pred_n.shape[0])}, "
+                f"expected K*y_ch={self.Y_model}.")
+
+        return self._reconstruct_maps(pred_n, x)
+
+    # --------------------------------------------------------------
+    # per-TX prediction (single-patch mode) and tiling
+    # --------------------------------------------------------------
+    def predict_for_tx(self, tx_pos_xyz: np.ndarray):
+        assert self._base_scene is not None, "call attach_scene() first"
+
+        tx_pos_xyz = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
+        key = tuple(np.round(tx_pos_xyz, 3).tolist())
+
+        if self._needs_tiling:
+            # In tiling mode, we defer inference to sample_heads.
+            # Just store the TX position for later.
+            self._cached_tx_key = key
+            self._cached_tx_pos = tx_pos_xyz.copy()
+            # invalidate patch cache if TX changed
+            if self._cached_tile_tx_key != key:
+                self._cached_patch_key = None
+                self._cached_patch_maps = None
+            return
+
+        if key == self._cached_tx_key and self._cached_maps is not None:
+            return
+
+        adb = AntennaDatabase(tx_pos_xyz.reshape(1, 3), self._rx_coords, None, self._rx_grid)
+        scene = replace(self._base_scene, antenna_database=adb)
+
+        self._cached_maps = self._predict_maps(scene)
+        self._cached_tx_key = key
+        self._cached_tx_pos = tx_pos_xyz.copy()
+
+        # #DEBUG DUMP
+        # self._dump_wb_debug_png(
+        #     maps=self._cached_maps,
+        #     tx_pos_xyz=tx_pos_xyz,
+        #     origin_xyz=self._origin,
+        #     out_dir="debug_wb_unet",
+        #     prefix="unet_full",
+        # )
+
     def _patch_key_for(self, rx_xyz):
         """Snap an RX position to a patch-grid cell (stride = half patch)."""
         stride = (self.W // 2) * self.scale_m  # 32 cells in meters
@@ -281,119 +510,14 @@ class UNetTdlPropagator:
         adb = AntennaDatabase(tx_pos.reshape(1, 3), rx_coords, None, rx_grid)
         patch_scene = dc_replace(self._base_scene, antenna_database=adb)
 
-        x = build_feature_tensor(patch_scene, self.fc_hz, requested=self.dataset_features).astype(np.float32)
-        c_in = x.shape[1]
-        x_stack = x.transpose(0, 2, 1, 3, 4).reshape(1, self.K * c_in, self.H, self.W)
-        x_chw = x_stack[0]
-
-        if self.keep_idx is not None:
-            x_chw = x_chw[self.keep_idx, :, :]
-
-        x_t = torch.from_numpy(x_chw).to(self.device)
-        pred = self._forward(x_t)
-
-        y_ch = 4
-        maps = pred.view(self.K, y_ch, self.H, self.W).detach().float().cpu().numpy()
-
+        self._cached_patch_maps = self._predict_maps(patch_scene)
         self._cached_patch_key = patch_key
         self._cached_patch_origin = patch_origin
-        self._cached_patch_maps = maps
         self._cached_tile_tx_key = tuple(np.round(tx_pos, 3).tolist())
 
-    def _forward(self, x_chw: torch.Tensor) -> torch.Tensor:
-        # x_chw: (C_model,H,W)
-        x_n = (x_chw - self.x_mean) / self.x_std
-        with torch.no_grad():
-            pred_n = self.model(x_n.unsqueeze(0)).squeeze(0)  # (Y_model,H,W)
-        pred = pred_n * self.y_std + self.y_mean
-        return pred
-
-    def predict_for_tx(self, tx_pos_xyz: np.ndarray):
-        assert self._base_scene is not None, "call attach_scene() first"
-
-        tx_pos_xyz = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
-
-        if self._needs_tiling:
-            # In tiling mode, we defer inference to sample_heads.
-            # Just store the TX position for later.
-            key = tuple(np.round(tx_pos_xyz, 3).tolist())
-            self._cached_tx_key = key
-            self._cached_tx_pos = tx_pos_xyz.copy()
-            # invalidate patch cache if TX changed
-            if self._cached_tile_tx_key != key:
-                self._cached_patch_key = None
-                self._cached_patch_maps = None
-            return
-
-        key = tuple(np.round(tx_pos_xyz, 3).tolist())
-        if key == self._cached_tx_key and self._cached_maps is not None:
-            return
-
-        adb = AntennaDatabase(tx_pos_xyz.reshape(1, 3), self._rx_coords, None, self._rx_grid)
-        scene = replace(self._base_scene, antenna_database=adb)
-
-        # x: (1, c_in, K, H, W)
-        x = build_feature_tensor(scene, self.fc_hz, requested=self.dataset_features).astype(np.float32)
-        c_in = x.shape[1]
-
-        # stack: (1,c_in,K,H,W) -> (1,K*c_in,H,W)
-        x_stack = x.transpose(0, 2, 1, 3, 4).reshape(1, self.K * c_in, self.H, self.W)
-        x_chw = x_stack[0]  # (K*c_in,H,W)
-
-        walls_khw = None
-        if "binary_walls" in self.dataset_features:
-            wall_idx = self.dataset_features.index("binary_walls")
-            walls_khw = x[0, wall_idx]   # shape: (K, H, W)
-
-        if self.keep_idx is not None:
-            if self.keep_idx.size != self.C_model:
-                raise RuntimeError(
-                    f"keep_idx size={self.keep_idx.size} but model expects C_model={self.C_model}. "
-                    "Your norm_stats/model are inconsistent."
-                )
-            x_chw = x_chw[self.keep_idx, :, :]
-
-        if x_chw.shape[0] != self.C_model:
-            if self.keep_idx is not None:
-                raise RuntimeError(
-                    f"Internal inconsistency: keep_idx size={self.keep_idx.size} "
-                    f"but resulting x_chw has {x_chw.shape[0]} channels, expected {self.C_model}. "
-                    "This suggests keep_idx is malformed."
-                )
-            else:
-                raise RuntimeError(
-                    f"UNet input channel mismatch: built K*c_in={x_chw.shape[0]} channels "
-                    f"(K={self.K}, c_in={c_in}) but model expects C_model={self.C_model} "
-                    f"(from norm_stats.x_mean). "
-                    f"This usually means your training used channel selection/reordering, but meta.json doesn't record it."
-                )
-
-        x_t = torch.from_numpy(x_chw).to(self.device)
-        pred = self._forward(x_t)  # (Y_model,H,W)
-
-        # output reshape: expect Y_model == K*y_ch
-        y_ch = 4  # delta, excess, tau_rms, wb
-        if self.Y_model != self.K * y_ch:
-            raise RuntimeError(
-                f"UNet output channel mismatch: model outputs Y_model={self.Y_model}, expected K*y_ch={self.K*y_ch}. "
-                f"Either y_ch isn't 4 for this run, or the model isn't slice-stacked."
-            )
-
-        maps = pred.view(self.K, y_ch, self.H, self.W).detach().float().cpu().numpy()
-        self._cached_maps = maps
-        self._cached_tx_key = key
-
-        # #DEBUG DUMP
-        # self._dump_wb_debug_png(
-        #     maps=maps,
-        #     tx_pos_xyz=tx_pos_xyz,
-        #     origin_xyz=self._origin,
-        #     walls_khw=walls_khw,
-        #     out_dir="debug_wb_unet",
-        #     prefix="unet_full",
-        # )
-
-    # --- sampling + CFR synthesis stay the same as before ---
+    # --------------------------------------------------------------
+    # sampling
+    # --------------------------------------------------------------
     def _trilerp(self, vol_khw: np.ndarray, kf: float, yf: float, xf: float) -> float:
         K, H, W = vol_khw.shape
         kf = float(np.clip(kf, 0.0, K - 1.0))
@@ -420,7 +544,14 @@ class UNetTdlPropagator:
         return float(c0 * (1 - wk) + c1 * wk)
 
     def sample_heads(self, rx_pos_xyz: np.ndarray):
+        """Returns (wb_db, tau_rms_ns, excess_ns).
 
+        CONTRACT CHANGE vs. the legacy class:
+          * wb_db is the FULL wideband loss (wb_cost + gated residual),
+            already including all wall losses. Do NOT add FSPL to it.
+          * If the interpolated coverage probability is below cov_thresh,
+            wb_db == self.no_path_wb (sentinel) and tau == 0.
+          * excess_ns is always None (the head no longer exists)."""
         rx = np.asarray(rx_pos_xyz, dtype=np.float32).reshape(3)
         if not self._needs_tiling:
             # Original path: single full-scene grid
@@ -448,11 +579,15 @@ class UNetTdlPropagator:
 
         if (xf < 0 or xf > self.W-1 or yf < 0 or yf > self.H-1 or kf < 0 or kf > self.K-1):
             print(f"[warn] RX outside grid -> clamping: xf={xf:.2f}, yf={yf:.2f}, kf={kf:.2f}, rx={rx}")
-        wb = self._trilerp(maps[:, self.y_wb_idx, :, :], kf, yf, xf)
-        tau = self._trilerp(maps[:, self.y_tau_rms_idx, :, :], kf, yf, xf)
-        ex = self._trilerp(maps[:, self.y_excess_idx, :, :], kf, yf, xf) if self.y_excess_idx >= 0 else None
-        return float(wb), float(tau), (None if ex is None else float(ex))
-    
+
+        wb = self._trilerp(maps[:, 0, :, :], kf, yf, xf)
+        tau = self._trilerp(maps[:, 1, :, :], kf, yf, xf)
+        cov = self._trilerp(maps[:, 2, :, :], kf, yf, xf)
+
+        if cov < self.cov_thresh:
+            return float(self.no_path_wb), 0.0, None
+        return float(wb), float(max(tau, 0.0)), None
+
     def _dump_wb_debug_png(
         self,
         maps: np.ndarray,
@@ -463,7 +598,7 @@ class UNetTdlPropagator:
         prefix: str = "unet",
     ):
         """
-        maps:      (K, y_ch, H, W)
+        maps:      (K, 3, H, W) physical [wb_db, tau_ns, cov_prob]
         tx_pos_xyz:(3,)
         origin_xyz:(3,)
         walls_khw: optional (K, H, W) binary wall map on same grid
@@ -478,23 +613,12 @@ class UNetTdlPropagator:
         tx = np.asarray(tx_pos_xyz, dtype=np.float32).reshape(3)
         x0, y0, z0 = [float(v) for v in origin_xyz]
 
-        xs = x0 + self.scale_m * np.arange(self.W, dtype=np.float32)
-        ys = y0 + self.scale_m * np.arange(self.H, dtype=np.float32)
-        zs = z0 + self.z_step_m * np.arange(self.K, dtype=np.float32)
-        Z, Y, X = np.meshgrid(zs, ys, xs, indexing="ij")
-
-        d_m = np.sqrt((X - tx[0])**2 + (Y - tx[1])**2 + (Z - tx[2])**2).astype(np.float32)
-        d_m = np.maximum(d_m, 1e-6)
-
-        lam = 299792458.0 / float(self.fc_hz)
-        fspl_db = 20.0 * np.log10(4.0 * np.pi * d_m / lam)
-
-        # current server logic treats y_wb_idx as delta over Friis
-        delta_db = maps[:, self.y_wb_idx, :, :]
-        wb_db = fspl_db + delta_db
+        # wb map is already the full loss -- no Friis reconstruction needed
+        wb_db = maps[:, 0, :, :]
+        cov = maps[:, 2, :, :]
 
         wb_plot = wb_db.copy()
-        wb_plot[wb_plot >= (self.no_path_wb - 1e-3)] = np.nan
+        wb_plot[cov < self.cov_thresh] = np.nan
 
         for k in range(self.K):
             plt.figure(figsize=(6, 5))
@@ -534,7 +658,14 @@ class UNetTdlPropagator:
             plt.close()
 
 
-    def synthesize_cfr(self, tau_rms_ns: float, mi_scene, tx_xyz, rx_xyz, seed: int) -> np.ndarray:
+    def synthesize_cfr(self, tau_rms_ns: float, mi_scene, tx_xyz, rx_xyz, seed: int, synthetic = False) -> np.ndarray:
+
+
+        if not synthetic:
+            H = np.ones(self.fft_size, dtype=np.complex64)
+            if self.fft_shift:
+                H = np.fft.fftshift(H)
+            return H
 
         def is_los_mi(mi_scene, tx_xyz, rx_xyz, eps=1e-2):
             tx = np.asarray(tx_xyz, dtype=np.float32)
@@ -959,7 +1090,13 @@ class Cost231Propagator:
 
         return float(wb_db), float(tau_rms_ns), float(excess_ns)
 
-    def synthesize_cfr(self, tau_rms_ns: float, mi_scene, tx_xyz, rx_xyz, seed: int) -> np.ndarray:
+    def synthesize_cfr(self, tau_rms_ns: float, mi_scene, tx_xyz, rx_xyz, seed: int, synthetic = False) -> np.ndarray:
+
+        if not synthetic:
+            H = np.ones(self.fft_size, dtype=np.complex64)
+            if self.fft_shift:
+                H = np.fft.fftshift(H)
+            return H
 
         def is_los_mi(mi_scene, tx_xyz, rx_xyz, eps=1e-2):
             tx = np.asarray(tx_xyz, dtype=np.float32)
@@ -1045,6 +1182,7 @@ class SionnaEnv:
     """
     def __init__(self, model_folder='./models/', rt_fast=False, default_mode=MODE_P2P, rt_max_parallel_links=256, est_csi=True, 
                  use_unet=False, unet_run="unet10int", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
+                 unet_cov_thresh=0.5,
                  VERBOSE=True,
                  CHECKS_ENABLED=True,
                  mobility_trace_in: str = "",
@@ -1087,9 +1225,13 @@ class SionnaEnv:
         self.unet_run = unet_run
         self.unet_device = unet_device
         self.unet_no_path_wb = unet_no_path_wb
+        # DEPRECATED: head indices are fixed by the residual-over-cost model
+        # ([r, tau, coverage_logit]); these are kept only for CLI compatibility
+        # and are NOT passed to the propagator anymore.
         self.unet_y_wb_idx = unet_y_wb_idx
         self.unet_y_tau_rms_idx = unet_y_tau_rms_idx
         self.unet_y_excess_idx = unet_y_excess_idx
+        self.unet_cov_thresh = float(unet_cov_thresh)
         self._unet = None
 
         if not self.use_unet:
@@ -1206,10 +1348,8 @@ class SionnaEnv:
                     run_dir=self.unet_run,
                     device=self.unet_device,
                     no_path_wb=self.unet_no_path_wb,
-                    y_wb_idx=self.unet_y_wb_idx,
-                    y_tau_rms_idx=self.unet_y_tau_rms_idx,
-                    y_excess_idx=self.unet_y_excess_idx,
-                    # IMPORTANT: set these to match training_tdl CFG
+                    cov_thresh=self.unet_cov_thresh,
+                    # IMPORTANT: set these to match train_delta_tau CFG
                     scale_m=0.625,
                     z_step_cells=1.0,
                     z_margin_m=0.625 * 0.5,   # if training used z_margin=0.5 cells
@@ -1502,12 +1642,11 @@ class SionnaEnv:
         - One CSI sample per time in `lah_time_vec`
         - Each sample contains all RX nodes
         - CFR is normalized (mean |H|^2 ~= 1) when `self.est_csi` is enabled
-        """
 
-        def fspl_db(d_m: float, fc_hz: float) -> float:
-            d_m = max(float(d_m), 1e-6)
-            lam = 299792458.0 / float(fc_hz)
-            return 20.0 * np.log10(4.0 * np.pi * d_m / lam)
+        NOTE (residual-over-cost model): sample_heads() returns the FULL
+        wideband loss (wb_cost + gated residual, or the no-path sentinel
+        when the coverage head says there is no path). Do NOT add FSPL.
+        """
 
         # Precompute lists to avoid huge Python overhead in inner loops
         freqs_list = self.frequencies.tolist()
@@ -1536,16 +1675,16 @@ class SionnaEnv:
             for curr_rx_node in rx_nodes:
                 rx_pos = np.array(self.node_info[curr_rx_node].get_pos_at(lah_time), dtype=np.float32)
 
-                delta_db, tau_rms_ns, excess_ns = self._unet.sample_heads(rx_pos)
+                # FULL wideband loss directly from the surrogate (no FSPL added)
+                wb_db, tau_rms_ns, excess_ns = self._unet.sample_heads(rx_pos)
+                wb_db = float(wb_db)
                 d_m = float(np.linalg.norm(tx_pos - rx_pos))
-                friis_loss_db = fspl_db(d_m, self.fc)
-                wb_db = float(friis_loss_db + float(delta_db))
 
                 base_ns = d_m / 299792458.0 * 1e9
                 ex = 0.0 if excess_ns is None else float(max(0.0, excess_ns))
                 delay_ns = base_ns + ex
 
-                no_path = wb_db >= (self.unet_no_path_wb - 1e-3)
+                no_path = wb_db >= (self._unet.no_path_wb - 1e-3)
 
                 rx_node_info = csi.rx_nodes.add()
                 rx_node_info.id = int(curr_rx_node)
@@ -1555,7 +1694,7 @@ class SionnaEnv:
 
                 if no_path:
                     rx_node_info.delay = 0
-                    rx_node_info.wb_loss = float(self.unet_no_path_wb)
+                    rx_node_info.wb_loss = float(self._unet.no_path_wb)
                     if self.est_csi:
                         rx_node_info.frequencies.extend(freqs_list)
                         rx_node_info.csi_imag.extend(zeros_f_list)
@@ -1607,7 +1746,11 @@ class SionnaEnv:
     
     def _compute_cfr_with_lookahead_surrogate(self, lah_time_vec, tx_node_id, rx_nodes, reply_wrapper,
                                                propagator, no_path_wb, is_delta, label):
-        """Generic LAH path for any propagator with predict_for_tx/sample_heads/synthesize_cfr interface."""
+        """Generic LAH path for any propagator with predict_for_tx/sample_heads/synthesize_cfr interface.
+
+        is_delta=True is only valid for LEGACY delta-over-Friis propagators.
+        The residual-over-cost UNet and COST-231 both return the full
+        wideband loss (is_delta=False)."""
 
         def fspl_db(d_m, fc_hz):
             d_m = max(float(d_m), 1e-6)
@@ -2175,19 +2318,21 @@ class SionnaEnv:
 
                 rx_pos = np.array(self.node_info[curr_rx_node].pos, dtype=np.float32)
 
-                delta_db, tau_rms_ns, excess_ns = self._unet.sample_heads(rx_pos)
+                # RESIDUAL-OVER-COST MODEL: sample_heads returns the FULL
+                # wideband loss (wb_cost + gated residual). Do NOT add FSPL.
+                wb_db, tau_rms_ns, excess_ns = self._unet.sample_heads(rx_pos)
+                wb_db = float(wb_db)
                 d_m = float(np.linalg.norm(tx_pos - rx_pos))
-                friis_loss_db = fspl_db(d_m, self.fc)
-                wb_db = friis_loss_db + float(delta_db)
 
-                # no-path guard
-                if wb_db >= (self.unet_no_path_wb - 1e-3):
-                    lnk_loss_arr.append(float(self.unet_no_path_wb))
+                # no-path guard (sentinel is emitted by the coverage head)
+                if wb_db >= (self._unet.no_path_wb - 1e-3):
+                    lnk_loss_arr.append(float(self._unet.no_path_wb))
                     lnk_delay_arr.append(0)
                     h_normalized_arr.append(np.zeros((self.fft_size,), dtype=np.complex64))
                     continue
 
-                ##Friis for comparison###
+                ##Friis for comparison (debug print only; NOT added to wb)###
+                friis_loss_db = fspl_db(d_m, self.fc)
                 print(f"[FRIIS] tx={tx_node} rx={curr_rx_node} d={d_m:.3f} m fspl={friis_loss_db:.2f} dB")
 
                 base_ns = d_m / 299792458.0 * 1e9
@@ -2632,12 +2777,13 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
 
     parser.add_argument("--use_unet", action="store_true", help="Use U-Net surrogate instead of Sionna ray tracing")
-    parser.add_argument("--unet_run", type=str, default="unet10int_mixed_hard", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
+    parser.add_argument("--unet_run", type=str, default="unet_shannon", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
     parser.add_argument("--unet_device", type=str, default="cuda", help="cpu|cuda|cuda:0")
     parser.add_argument("--unet_no_path_wb", type=float, default=199.5, help="No-path sentinel wb_loss (dB)")
-    parser.add_argument("--unet_y_wb_idx", type=int, default=0, help="Which output channel is delta_wb (dB)")
-    parser.add_argument("--unet_y_tau_rms_idx", type=int, default=2, help="Which output channel is tau_rms (ns)")
-    parser.add_argument("--unet_y_excess_idx", type=int, default=-1, help="Optional channel index for excess delay (ns), -1 disables")
+    parser.add_argument("--unet_cov_thresh", type=float, default=0.5, help="Coverage-probability threshold below which a link is declared no-path")
+    parser.add_argument("--unet_y_wb_idx", type=int, default=0, help="DEPRECATED (ignored): residual model has fixed head layout [r, tau, coverage_logit]")
+    parser.add_argument("--unet_y_tau_rms_idx", type=int, default=2, help="DEPRECATED (ignored): residual model has fixed head layout")
+    parser.add_argument("--unet_y_excess_idx", type=int, default=-1, help="DEPRECATED (ignored): residual model has no excess-delay head")
     parser.add_argument("--mobility_trace_in", type=str, default="",
                     help="CSV with t_s,node,x,y,z,... used to drive mobility deterministically")
     parser.add_argument("--use_cost231", action="store_true", help="Use COST-231 multi-wall model (no RT, no UNet)")
@@ -2652,6 +2798,7 @@ if __name__ == '__main__':
         env = SionnaEnv(args.model_folder, args.rt_fast, args.default_mode, args.rt_max_parallel_links,
                         args.est_csi, args.use_unet, args.unet_run, args.unet_device, args.unet_no_path_wb,
                         args.unet_y_wb_idx,  args.unet_y_tau_rms_idx, args.unet_y_excess_idx,
+                        unet_cov_thresh=args.unet_cov_thresh,
                         VERBOSE=args.verbose,
                         mobility_trace_in=args.mobility_trace_in,
                         use_cost231=args.use_cost231,
@@ -2660,4 +2807,3 @@ if __name__ == '__main__':
 
         if args.single_run:
             break
-
