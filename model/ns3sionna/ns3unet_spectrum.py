@@ -3086,7 +3086,7 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
 
     parser.add_argument("--use_unet", action="store_true", help="Use U-Net surrogate instead of Sionna ray tracing")
-    parser.add_argument("--unet_run", type=str, default="unet10int_mixed_hard", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
+    parser.add_argument("--unet_run", type=str, default="residual_cost_v2", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
     parser.add_argument("--unet_device", type=str, default="cuda", help="cpu|cuda|cuda:0")
     parser.add_argument("--unet_no_path_wb", type=float, default=199.5, help="No-path sentinel wb_loss (dB)")
     parser.add_argument("--unet_cov_thresh", type=float, default=0.5, help="Coverage-probability threshold below which a link is declared no-path")
