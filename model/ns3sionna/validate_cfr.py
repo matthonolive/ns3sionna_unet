@@ -217,6 +217,7 @@ def main():
                            orientation=[0, -180, 0]))
 
     rt = dict(max_depth=3 if args.rt_fast else 10, samples_per_src=10 ** 6,
+              max_num_paths_per_src=10 ** 6 if args.rt_fast else 10 ** 7,
               los=True, specular_reflection=True,
               diffuse_reflection=not args.rt_fast, refraction=True,
               synthetic_array=False, diffraction=not args.rt_fast,
