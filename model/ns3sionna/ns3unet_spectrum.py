@@ -1468,7 +1468,8 @@ class SionnaEnv:
             # systematically darkening deep-NLOS ground truth (the same
             # mechanism behind the +8.8 dB label bias). Convergence backed by
             # rt_batch_probe.py (solo/crowd x 1e6/1e7).
-            self.rt_samples_per_src = 10 ** 7
+            self.rt_samples_per_src = 10 ** 6
+            self.rt_max_num_paths_per_src = 10**7
             self.rt_los = True  # compute and include the direct Line-of-Sight path when it exists
             self.rt_specular_reflection = True  # Can rays bounce off surfaces?
             self.rt_diffuse_reflection = True
@@ -1870,6 +1871,7 @@ class SionnaEnv:
         paths = p_solver(scene=self.scene,
                          max_depth=self.rt_max_depth,
                          samples_per_src=self.rt_samples_per_src,
+                         max_num_paths_per_src=self.rt_max_num_paths_per_src,
                          los=self.rt_los,
                          specular_reflection=self.rt_specular_reflection,  # Can rays bounce off surfaces?
                          diffuse_reflection=self.rt_diffuse_reflection,
@@ -2487,6 +2489,7 @@ class SionnaEnv:
                     scene=self.scene,
                     max_depth=self.rt_max_depth,
                     samples_per_src=self.rt_samples_per_src,
+                    max_num_paths_per_src=self.rt_max_num_paths_per_src,
                     los=self.rt_los,
                     specular_reflection=self.rt_specular_reflection,
                     diffuse_reflection=self.rt_diffuse_reflection,
@@ -2817,6 +2820,7 @@ class SionnaEnv:
         paths = p_solver(scene=self.scene,
                          max_depth=self.rt_max_depth,
                          samples_per_src=self.rt_samples_per_src,
+                         max_num_paths_per_src=self.rt_max_num_paths_per_src,
                          los=self.rt_los,
                          specular_reflection=self.rt_specular_reflection,  # Can rays bounce off surfaces?
                          diffuse_reflection=self.rt_diffuse_reflection,
@@ -3150,7 +3154,7 @@ if __name__ == '__main__':
     parser.add_argument("--single_run", help="Whether not to terminate after single run", action='store_true')
     parser.add_argument("--default_mode", type=int, default=SionnaEnv.MODE_P2MP, help="Which mode to use if not set by ns3")
     parser.add_argument("--rt_fast", help="Use simplified raytracing for faster computations", action='store_true')
-    parser.add_argument("--rt_max_parallel_links", type=int, default=256, help="Max no. of link simulated at once; depends on GPU memory")
+    parser.add_argument("--rt_max_parallel_links", type=int, default=32, help="Max no. of link simulated at once; depends on GPU memory")
     parser.add_argument("--est_csi", action="store_true", help="Send CSI vectors (needed for spectrum model)")
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
 
