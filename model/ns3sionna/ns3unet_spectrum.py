@@ -28,6 +28,7 @@ except Exception:
 
 
 import mitsuba as mi
+import drjit as _dr  # allocator hygiene (flush_malloc_cache); aliased to avoid clashes
 import math
 from millify import millify
 
@@ -1028,6 +1029,8 @@ class Cost231Propagator:
                  default_tau_rms_ns=5.0, k_los_db=6.0, k_nlos_db=2.0):
         self.scale_m = float(scale_m)
         self.H, self.W, self.K = int(H), int(W), int(K)
+        # minimum grid dims; attach_scene() enlarges H/W to cover the scene
+        self._base_H, self._base_W = int(H), int(W)
         self.z_step_m = float(scale_m * z_step_cells)
         self.z_margin_m = float(z_margin_m)
         self.origin_xy_mode = origin_xy_mode
@@ -1101,6 +1104,30 @@ class Cost231Propagator:
             z0 = max(z_min, (z_max - self.z_margin_m) - total_span)
 
         self._origin = np.array([x0, y0, z0], dtype=np.float32)
+
+        # --- size the grid to cover the whole scene ------------------------
+        # FIX (tier_large LOS-gate defect): the stock 64x64 grid spans only
+        # 40 m at 0.625 m/cell, and _trilerp CLAMPS out-of-range coordinates.
+        # On scenes larger than one patch (tier_medium/large) every RX beyond
+        # the grid was silently pinned to the grid edge, so the cost231 leg
+        # reported wrong wb losses over most of the scene -- observed in the
+        # campaigns as unet != cost231 (r != 0) at zero-wall links. Unlike
+        # the U-Net, the analytic map has no trained patch size, so we simply
+        # enlarge the grid to the scene footprint (cost scales linearly in
+        # cells: one ray bundle per cell).
+        span_x = float(bbox.max.x) - x0
+        span_y = float(bbox.max.y) - y0
+        W_needed = int(np.ceil(span_x / self.scale_m)) + 1
+        H_needed = int(np.ceil(span_y / self.scale_m)) + 1
+        self.W = int(np.clip(W_needed, self._base_W, 1024))
+        self.H = int(np.clip(H_needed, self._base_H, 1024))
+        print(f"[COST231] grid sized to scene: {self.H}x{self.W} cells "
+              f"({self.H * self.scale_m:.1f} x {self.W * self.scale_m:.1f} m)")
+
+        # new scene -> old map invalid (latent stale-cache bug when the
+        # server is reused across sim inits and a TX position recurs)
+        self._cached_tx_key = None
+        self._cached_cost_map = None
 
         self._rx_grid = AntennaGrid(
             origin=self._origin,
@@ -1408,7 +1435,7 @@ class SionnaEnv:
     author: Pilz, Zubow
     """
     def __init__(self, model_folder='./models/', rt_fast=False, default_mode=MODE_P2P, rt_max_parallel_links=256, est_csi=True, 
-                 use_unet=False, unet_run="unet10int", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
+                 use_unet=False, unet_run="residual_cost_v2", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
                  unet_cov_thresh=0.5, unet_tx_cache=256,
                  VERBOSE=True,
                  CHECKS_ENABLED=True,
@@ -1417,7 +1444,8 @@ class SionnaEnv:
                  use_logdist=False, logdist_exponent=3.0, logdist_ref_m=1.0,
                  logdist_tau_rms_ns=5.0,
                  synthetic_cfr=False,
-                 cfr_k_los_db=6.0, cfr_k_nlos_db=2.0):
+                 cfr_k_los_db=6.0, cfr_k_nlos_db=2.0,
+                 rt_samples_per_src=None, rt_flush_every=8):
         self.model_folder = model_folder
         self.rt_fast = rt_fast
         if rt_fast:
@@ -1433,7 +1461,14 @@ class SionnaEnv:
             self.rt_diffraction_lit_region = False  # higher physical accuracy; for mmWave or THz channels
         else: # realistic but slow
             self.rt_max_depth = 10  # sufficient even for rich multipath
-            self.rt_samples_per_src = 10 ** 6  # 10 ** 6
+            # RAISED 1e6 -> 1e7 to match the v2 training-label convention.
+            # samples_per_src is shared across every receiver placed in the
+            # solve (up to rt_max_parallel_links=256 in LAH mode); at 1e6 the
+            # per-receiver diffuse/higher-order path capture is diluted,
+            # systematically darkening deep-NLOS ground truth (the same
+            # mechanism behind the +8.8 dB label bias). Convergence backed by
+            # rt_batch_probe.py (solo/crowd x 1e6/1e7).
+            self.rt_samples_per_src = 10 ** 7
             self.rt_los = True  # compute and include the direct Line-of-Sight path when it exists
             self.rt_specular_reflection = True  # Can rays bounce off surfaces?
             self.rt_diffuse_reflection = True
@@ -1442,6 +1477,19 @@ class SionnaEnv:
             self.rt_diffraction = True  # costly
             self.rt_edge_diffraction = True  # rays that bend around edges
             self.rt_diffraction_lit_region = True  # higher physical accuracy; for mmWave or THz channels
+
+        # explicit override (A/B probes, convergence sweeps)
+        if rt_samples_per_src is not None:
+            self.rt_samples_per_src = int(rt_samples_per_src)
+
+        # Dr.Jit allocator hygiene: the malloc cache grows by a few MB per
+        # PathSolver call and is never trimmed. Over hundreds of CSI requests
+        # this eats the VRAM headroom on an 8 GB WDDM GPU and triggers paging
+        # stalls (~35x slowdown) -- same failure mode as the label-generation
+        # pipeline, fixed the same way: flush every N solves, INSIDE the
+        # serving loop, not per-scene.
+        self._rt_flush_every = max(1, int(rt_flush_every))
+        self._rt_solves_since_flush = 0
 
         # default mode
         self.default_mode = default_mode
@@ -1467,7 +1515,9 @@ class SionnaEnv:
         self._unet = None
 
         if not self.use_unet:
-            print(f'Init ns3sionna with rt_fast={rt_fast}, est_csi={est_csi}')
+            print(f'Init ns3sionna with rt_fast={rt_fast}, est_csi={est_csi}, '
+                  f'rt_samples_per_src={self.rt_samples_per_src:.0e}, '
+                  f'rt_flush_every={self._rt_flush_every}')
 
         # cost231
         self.use_cost231 = use_cost231
@@ -1667,6 +1717,18 @@ class SionnaEnv:
         return True, "OK"
 
 
+    def _rt_after_solve(self, n_solves: int = 1):
+        """Call after each PathSolver solve. Flushes the Dr.Jit malloc cache
+        every self._rt_flush_every solves so cached allocations can't
+        accumulate across CSI requests (WDDM paging -> stalls)."""
+        self._rt_solves_since_flush += int(n_solves)
+        if self._rt_solves_since_flush >= self._rt_flush_every:
+            try:
+                _dr.flush_malloc_cache()
+            except Exception as e:
+                print(f"[RT] dr.flush_malloc_cache() failed: {e}", flush=True)
+            self._rt_solves_since_flush = 0
+
     def _tim_add(self, key: str, dt_s: float):
         d = self._tim[key]
         d["n"] += 1
@@ -1830,6 +1892,9 @@ class SionnaEnv:
                   # antennas of a transmitter and receiver arrives at tau=0
                   normalize=False,  # Normalize energy
                   out_type="numpy")
+
+        # RT outputs are numpy now; allow the allocator cache to be trimmed
+        self._rt_after_solve()
 
         # max single transmitter
         assert h_raw.shape[2] == 1
@@ -2460,6 +2525,7 @@ class SionnaEnv:
                         wb_flat[start + j] = float(-10.0 * np.log10(pwr))
 
                 print(f"[RTDBG] finished batch {start}:{stop} / {rx_coords.shape[0]}")
+                self._rt_after_solve()
 
             finally:
                 for name in temp_names:
@@ -2777,6 +2843,9 @@ class SionnaEnv:
                   # antennas of a transmitter and receiver arrives at tau=0
                   normalize=False,  # Normalize energy
                   out_type="numpy")
+
+        # RT outputs are numpy now; allow the allocator cache to be trimmed
+        self._rt_after_solve()
 
         lnk_delay_arr = []
         lnk_loss_arr = []
@@ -3105,6 +3174,10 @@ if __name__ == '__main__':
     parser.add_argument("--synthetic_cfr", action="store_true", help="Send synthetic tau-shaped Rician CFRs from surrogates instead of flat CFRs (for CFR-level validation)")
     parser.add_argument("--cfr_k_los_db", type=float, default=6.0, help="Rician K (dB) for synthetic CFRs on LOS links (RT-calibrated default)")
     parser.add_argument("--cfr_k_nlos_db", type=float, default=2.0, help="Rician K (dB) for synthetic CFRs on NLOS links (RT-calibrated default)")
+    parser.add_argument("--rt_samples_per_src", type=float, default=None,
+                    help="Override RT ray budget per source (default: 1e7 realistic, 1e6 with --rt_fast). Shared across all receivers in a solve.")
+    parser.add_argument("--rt_flush_every", type=int, default=8,
+                    help="Flush the Dr.Jit malloc cache every N RT solves (allocator hygiene on WDDM GPUs)")
     args = parser.parse_args()
 
     print("ns3sionna v1.0")
@@ -3127,7 +3200,9 @@ if __name__ == '__main__':
                         logdist_tau_rms_ns=args.logdist_tau_rms_ns,
                         synthetic_cfr=args.synthetic_cfr,
                         cfr_k_los_db=args.cfr_k_los_db,
-                        cfr_k_nlos_db=args.cfr_k_nlos_db)
+                        cfr_k_nlos_db=args.cfr_k_nlos_db,
+                        rt_samples_per_src=args.rt_samples_per_src,
+                        rt_flush_every=args.rt_flush_every)
         env.run()
 
         if args.single_run:
