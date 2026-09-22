@@ -170,6 +170,8 @@ class UNetTdlPropagator:
         fft_shift: bool = False,
         cov_thresh: float = 0.5,           # no-path threshold on coverage head
         tx_cache_size: int = 256,          # LRU size for per-TX/(TX,patch) map cache
+        patch_stride_cells: int = 32,      # tiling: patch-origin grid (cells); 32 guarantees any
+                                           # TX-RX pair within 48 cells per axis fits one patch
         k_los_db: float = 6.0,             # Rician K for CFR synthesis (LOS)
         k_nlos_db: float = 2.0,            # Rician K for CFR synthesis (NLOS)
         # ---- legacy kwargs: accepted and ignored ----
@@ -233,8 +235,18 @@ class UNetTdlPropagator:
         self.no_path_wb = float(self.meta.get("no_path_wb_db", no_path_wb))
         self.cov_thresh = float(cov_thresh)
         self.los_gate_residual = bool(self.meta.get("los_gate_residual", True))
+        # The coverage-head LOS guarantee is independent of the residual
+        # gate: v3 checkpoints train the residual at LOS
+        # (los_gate_residual=false in meta.json) but a LOS link still always
+        # has a path. Absent key -> True, so v2 checkpoints are unchanged.
+        self.los_gate_coverage = bool(self.meta.get("los_gate_coverage", True))
         self.nobs_los_thresh = float(self.meta.get("nobs_los_thresh", 0.5))
         self.r_clip_db = float(self.meta.get("r_clip_db", 60.0))
+        self.patch_stride_cells = int(patch_stride_cells)   # tiling policy (used below + in _patch_key_for)
+        print(f"[UNet] run={run}  los_gate_residual={self.los_gate_residual}  "
+        f"los_gate_coverage={self.los_gate_coverage}  "
+        f"nobs_los_thresh={self.nobs_los_thresh}  "
+        f"patch_stride_cells={self.patch_stride_cells}", flush=True)
         self.tau_target = str(self.meta.get("tau_target", "raw"))
         self.tau_log_eps_ns = float(self.meta.get("tau_log_eps_ns", 1e-3))
         self.fft_shift = bool(fft_shift)
@@ -385,6 +397,8 @@ class UNetTdlPropagator:
         scene_cells_x = int(np.ceil((float(bbox.max.x) - self._bbox_min_x) / self.scale_m))
         scene_cells_y = int(np.ceil((float(bbox.max.y) - self._bbox_min_y) / self.scale_m))
         self._needs_tiling = (scene_cells_x > self.W) or (scene_cells_y > self.H)
+        self._scene_cells_x = int(scene_cells_x)
+        self._scene_cells_y = int(scene_cells_y)
 
         if self._needs_tiling:
             print(f"[UNet] Scene is {scene_cells_x}x{scene_cells_y} cells, patch is {self.W}x{self.H} -> tiling enabled")
@@ -494,7 +508,7 @@ class UNetTdlPropagator:
                        np.exp(-np.abs(z)) / (1.0 + np.exp(-np.abs(z)))).astype(np.float32)
         # LOS always has a path: mirror the training-time guarantee so the
         # coverage head can never drop a true-LOS link
-        if self.los_gate_residual:
+        if self.los_gate_coverage:
             cov[nobs < self.nobs_los_thresh] = 1.0
 
         return np.stack([wb, tau, cov], axis=1)   # (K, 3, H, W)
@@ -576,22 +590,55 @@ class UNetTdlPropagator:
         #     prefix="unet_full",
         # )
 
-    def _patch_key_for(self, rx_xyz):
-        """Snap an RX position to a patch-grid cell (stride = half patch)."""
-        stride = (self.W // 2) * self.scale_m  # 32 cells in meters
-        ix = int(np.floor((rx_xyz[0] - self._bbox_min_x) / stride))
-        iy = int(np.floor((rx_xyz[1] - self._bbox_min_y) / stride))
-        return (ix, iy)
+    def _patch_key_for(self, rx_xyz, tx_xyz=None):
+        """Serving patch for this RX: origin (ox, oy) in cells on a
+        patch_stride_cells grid, clamped so the patch NEVER overhangs the
+        scene. Among candidates containing the RX, prefer one that also
+        contains the TX (in-patch regime: 10x more training data and
+        calibrated at depth); otherwise the one nearest the TX.
 
-    def _patch_origin_for(self, patch_key, rx_xyz):
-        """Compute the world-space origin of a patch, ensuring RX is inside."""
-        stride = (self.W // 2) * self.scale_m
-        # start from the grid-snapped position
-        x0 = self._bbox_min_x + patch_key[0] * stride
-        y0 = self._bbox_min_y + patch_key[1] * stride
-        # clamp so patch doesn't extend past the original origin on the low end
-        x0 = max(x0, self._bbox_min_x)
-        y0 = max(y0, self._bbox_min_y)
+        Why: the previous RX-snapped policy put the TX outside the patch
+        for any link longer than ~half a patch, running the model in its
+        off-patch regime (540 training samples) where held-out 2/3+ wall
+        links carried a +1.3 dB excess bias; in-patch links at the same
+        depth beat COST-231 by ~35%. Patches could also overhang the scene
+        edge (only the low side was clamped), feeding the network a
+        half-empty patch it never saw in training."""
+        W, s, cell = self.W, self.patch_stride_cells, self.scale_m
+        rx_c = ((rx_xyz[0] - self._bbox_min_x) / cell,
+                (rx_xyz[1] - self._bbox_min_y) / cell)
+
+        def candidates(rc, S):
+            hi = max(S - W, 0)                      # last origin keeping the patch inside
+            ks = range(max(int(np.floor((rc - (W - 1)) / s)), 0),
+                       int(np.floor(rc / s)) + 1)
+            out = {min(k * s, hi) for k in ks}
+            out = {o for o in out if o <= rc < o + W} \
+                or {int(np.clip(np.floor(rc / s) * s, 0, hi))}
+            return sorted(out)
+
+        cx = candidates(rx_c[0], self._scene_cells_x)
+        cy = candidates(rx_c[1], self._scene_cells_y)
+        if tx_xyz is None:
+            return (cx[0], cy[0])
+        tx_c = ((tx_xyz[0] - self._bbox_min_x) / cell,
+                (tx_xyz[1] - self._bbox_min_y) / cell)
+
+        def off(o, tc):                             # cells the TX lies outside [o, o+W)
+            return max(o - tc, tc - (o + W - 1), 0.0)
+
+        mid = ((tx_c[0] + rx_c[0]) / 2, (tx_c[1] + rx_c[1]) / 2)
+        best = min(
+            (max(off(ox, tx_c[0]), off(oy, tx_c[1])),
+             abs(ox + W / 2 - mid[0]) + abs(oy + W / 2 - mid[1]),
+             ox, oy)
+            for ox in cx for oy in cy)
+        return (int(best[2]), int(best[3]))
+
+    def _patch_origin_for(self, patch_key, rx_xyz=None):
+        """World-space origin of a patch keyed by its (ox, oy) in cells."""
+        x0 = self._bbox_min_x + patch_key[0] * self.scale_m
+        y0 = self._bbox_min_y + patch_key[1] * self.scale_m
         return np.array([x0, y0, self._origin[2]], dtype=np.float32)
 
     def _run_patch(self, patch_key, tx_pos, rx_xyz):
@@ -674,7 +721,7 @@ class UNetTdlPropagator:
             maps = self._cached_maps
         else:
             # Tiling path: LRU keyed by (quantized TX, patch)
-            patch_key = self._patch_key_for(rx)
+            patch_key = self._patch_key_for(rx, self._cached_tx_pos)
             ck = (self._cached_tx_key, patch_key)
             entry = self._patch_cache.get(ck)
             if entry is None:
@@ -1435,7 +1482,7 @@ class SionnaEnv:
     author: Pilz, Zubow
     """
     def __init__(self, model_folder='./models/', rt_fast=False, default_mode=MODE_P2P, rt_max_parallel_links=256, est_csi=True, 
-                 use_unet=False, unet_run="residual_cost_v2", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
+                 use_unet=False, unet_run="residual_cost_v4", unet_device="cuda", unet_no_path_wb=199.5, unet_y_wb_idx=0, unet_y_tau_rms_idx=2, unet_y_excess_idx=-1,
                  unet_cov_thresh=0.5, unet_tx_cache=256,
                  VERBOSE=True,
                  CHECKS_ENABLED=True,
@@ -3159,7 +3206,7 @@ if __name__ == '__main__':
     parser.add_argument("--verbose", help="Whether to run in verbose mode", action='store_true')
 
     parser.add_argument("--use_unet", action="store_true", help="Use U-Net surrogate instead of Sionna ray tracing")
-    parser.add_argument("--unet_run", type=str, default="residual_cost_v2", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
+    parser.add_argument("--unet_run", type=str, default="residual_cost_v4", help="Path to run dir containing model.pt/meta.json/norm_stats.npz")
     parser.add_argument("--unet_device", type=str, default="cuda", help="cpu|cuda|cuda:0")
     parser.add_argument("--unet_no_path_wb", type=float, default=199.5, help="No-path sentinel wb_loss (dB)")
     parser.add_argument("--unet_cov_thresh", type=float, default=0.5, help="Coverage-probability threshold below which a link is declared no-path")
